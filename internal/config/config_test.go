@@ -439,8 +439,17 @@ func TestGetEffectiveSyncPaths(t *testing.T) {
 			wantLen:   len(SessionSyncPaths),
 		},
 		{
-			name:      "custom SyncPaths overrides sessions scope",
+			// Scope is a ceiling: an entirely out-of-scope custom list cannot
+			// widen a sessions config, and must not collapse to an empty set
+			// either, so it falls back to the scope defaults.
+			name:      "wholly out-of-scope custom paths fall back to sessions defaults",
 			syncPaths: []string{"custom-only"},
+			scope:     ScopeSessions,
+			wantLen:   len(SessionSyncPaths),
+		},
+		{
+			name:      "custom paths are narrowed to the sessions scope",
+			syncPaths: []string{"projects", "plugins", "CLAUDE.md"},
 			scope:     ScopeSessions,
 			wantLen:   1,
 		},
@@ -454,6 +463,59 @@ func TestGetEffectiveSyncPaths(t *testing.T) {
 				t.Errorf("GetEffectiveSyncPaths() returned %d paths, want %d", len(got), tt.wantLen)
 			}
 		})
+	}
+}
+
+// TestGetEffectiveSyncPathsScopeIsCeiling guards the regression that motivated
+// wiring up the override: `paths add|remove` materializes the full default path
+// list into sync_paths, so honoring that list verbatim would silently widen a
+// sessions-scoped config back into plugins/ (node_modules, .venv) on upgrade.
+func TestGetEffectiveSyncPathsScopeIsCeiling(t *testing.T) {
+	materialized := append([]string{}, SyncPaths...)
+	materialized = append(materialized, "my-extra-file.md")
+
+	cfg := &Config{SyncPaths: materialized, Scope: ScopeSessions}
+	got := cfg.GetEffectiveSyncPaths()
+
+	for _, p := range got {
+		if p == "plugins" {
+			t.Fatalf("sessions scope leaked plugins/ via sync_paths: %v", got)
+		}
+	}
+
+	for _, p := range got {
+		var inScope bool
+		for _, s := range SessionSyncPaths {
+			if p == s {
+				inScope = true
+				break
+			}
+		}
+		if !inScope {
+			t.Errorf("path %q is outside SessionSyncPaths but was returned", p)
+		}
+	}
+
+	if len(got) == 0 {
+		t.Error("effective sync paths must never be empty: an empty set makes " +
+			"DetectChanges report every tracked file as deleted, wiping the remote")
+	}
+}
+
+// TestGetEffectiveSyncPathsAppliedByFullScope covers the originally reported
+// bug: a custom sync_paths list under the default scope must be honored.
+func TestGetEffectiveSyncPathsAppliedByFullScope(t *testing.T) {
+	cfg := &Config{SyncPaths: []string{"CLAUDE.md", "my-extra-file.md"}}
+	got := cfg.GetEffectiveSyncPaths()
+
+	var found bool
+	for _, p := range got {
+		if p == "my-extra-file.md" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("custom sync_paths ignored under full scope: got %v", got)
 	}
 }
 

@@ -4,25 +4,27 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/tawanorg/claude-sync/internal/config"
 )
 
 func TestNewManager(t *testing.T) {
 	// With empty paths, should use defaults
-	m := NewManager(nil, nil, "/tmp/test")
-	if len(m.SyncPaths()) != len(DefaultSyncPaths) {
-		t.Errorf("Expected %d default paths, got %d", len(DefaultSyncPaths), len(m.SyncPaths()))
+	m := NewManager(nil, nil, "/tmp/test", config.ScopeFull)
+	if len(m.SyncPaths()) != len(DefaultSyncPaths(config.ScopeFull)) {
+		t.Errorf("Expected %d default paths, got %d", len(DefaultSyncPaths(config.ScopeFull)), len(m.SyncPaths()))
 	}
 
 	// With custom paths, should use those
 	custom := []string{"path1", "path2"}
-	m = NewManager(custom, nil, "/tmp/test")
+	m = NewManager(custom, nil, "/tmp/test", config.ScopeFull)
 	if len(m.SyncPaths()) != 2 {
 		t.Errorf("Expected 2 paths, got %d", len(m.SyncPaths()))
 	}
 }
 
 func TestAddPath(t *testing.T) {
-	m := NewManager([]string{"existing"}, nil, "/tmp/nonexistent")
+	m := NewManager([]string{"existing"}, nil, "/tmp/nonexistent", config.ScopeFull)
 
 	// Add new path
 	result := m.Add("newpath")
@@ -47,7 +49,7 @@ func TestAddPath(t *testing.T) {
 }
 
 func TestAddPathRemovesConflictingExcludes(t *testing.T) {
-	m := NewManager([]string{"a"}, []string{"b", "b/*", "c/**"}, "/tmp/test")
+	m := NewManager([]string{"a"}, []string{"b", "b/*", "c/**"}, "/tmp/test", config.ScopeFull)
 
 	// Add 'b' should remove 'b' and 'b/*' excludes
 	result := m.Add("b")
@@ -63,7 +65,7 @@ func TestAddPathRemovesConflictingExcludes(t *testing.T) {
 }
 
 func TestRemovePath(t *testing.T) {
-	m := NewManager([]string{"CLAUDE.md", "custom"}, nil, "/tmp/test")
+	m := NewManager([]string{"CLAUDE.md", "custom"}, nil, "/tmp/test", config.ScopeFull)
 
 	// Remove non-existent
 	result := m.Remove("nonexistent")
@@ -84,7 +86,7 @@ func TestRemovePath(t *testing.T) {
 	}
 
 	// Remove default path
-	m = NewManager([]string{"CLAUDE.md"}, nil, "/tmp/test")
+	m = NewManager([]string{"CLAUDE.md"}, nil, "/tmp/test", config.ScopeFull)
 	result = m.Remove("CLAUDE.md")
 	if !result.Removed {
 		t.Error("Expected Removed=true")
@@ -107,7 +109,7 @@ func TestRemoveDefaultPathAddsExclude(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m := NewManager(nil, nil, claudeDir)
+	m := NewManager(nil, nil, claudeDir, config.ScopeFull)
 
 	// Remove 'agents' (a directory)
 	result := m.Remove("agents")
@@ -122,7 +124,7 @@ func TestRemoveDefaultPathAddsExclude(t *testing.T) {
 }
 
 func TestAddExclude(t *testing.T) {
-	m := NewManager([]string{"plugins"}, []string{"existing/*"}, "/tmp/test")
+	m := NewManager([]string{"plugins"}, []string{"existing/*"}, "/tmp/test", config.ScopeFull)
 
 	// Add new exclude
 	result := m.AddExclude("plugins/**/node_modules/**")
@@ -147,7 +149,7 @@ func TestAddExclude(t *testing.T) {
 }
 
 func TestRemoveExclude(t *testing.T) {
-	m := NewManager(nil, []string{"a/*", "b/**"}, "/tmp/test")
+	m := NewManager(nil, []string{"a/*", "b/**"}, "/tmp/test", config.ScopeFull)
 
 	// Remove existing
 	result := m.RemoveExclude("a/*")
@@ -170,12 +172,13 @@ func TestReset(t *testing.T) {
 		[]string{"custom1", "custom2"},
 		[]string{"exclude1", "exclude2"},
 		"/tmp/test",
+		config.ScopeFull,
 	)
 
 	m.Reset()
 
-	if len(m.SyncPaths()) != len(DefaultSyncPaths) {
-		t.Errorf("Expected %d default paths after reset, got %d", len(DefaultSyncPaths), len(m.SyncPaths()))
+	if len(m.SyncPaths()) != len(DefaultSyncPaths(config.ScopeFull)) {
+		t.Errorf("Expected %d default paths after reset, got %d", len(DefaultSyncPaths(config.ScopeFull)), len(m.SyncPaths()))
 	}
 	if len(m.Excludes()) != 0 {
 		t.Errorf("Expected 0 excludes after reset, got %d", len(m.Excludes()))
@@ -183,7 +186,7 @@ func TestReset(t *testing.T) {
 }
 
 func TestIsDefault(t *testing.T) {
-	m := NewManager(nil, nil, "/tmp/test")
+	m := NewManager(nil, nil, "/tmp/test", config.ScopeFull)
 
 	if !m.IsDefault("CLAUDE.md") {
 		t.Error("CLAUDE.md should be a default")
@@ -198,7 +201,7 @@ func TestIsDefault(t *testing.T) {
 
 func TestStatus(t *testing.T) {
 	// Default state
-	m := NewManager(nil, nil, "/tmp/test")
+	m := NewManager(nil, nil, "/tmp/test", config.ScopeFull)
 	status := m.Status()
 	if status.IsCustomized {
 		t.Error("Default manager should not be customized")
@@ -218,7 +221,7 @@ func TestStatus(t *testing.T) {
 	}
 
 	// Remove default and check removed defaults tracking
-	m = NewManager(nil, []string{"CLAUDE.md/*"}, "/tmp/test")
+	m = NewManager(nil, []string{"CLAUDE.md/*"}, "/tmp/test", config.ScopeFull)
 	status = m.Status()
 	if len(status.RemovedDefaults) != 1 {
 		t.Errorf("Expected 1 removed default, got %d", len(status.RemovedDefaults))
@@ -226,7 +229,7 @@ func TestStatus(t *testing.T) {
 }
 
 func TestHasPath(t *testing.T) {
-	m := NewManager([]string{"a", "b"}, nil, "/tmp/test")
+	m := NewManager([]string{"a", "b"}, nil, "/tmp/test", config.ScopeFull)
 
 	if !m.HasPath("a") {
 		t.Error("Should have path 'a'")
@@ -237,7 +240,7 @@ func TestHasPath(t *testing.T) {
 }
 
 func TestHasExclude(t *testing.T) {
-	m := NewManager(nil, []string{"*.tmp", "cache/**"}, "/tmp/test")
+	m := NewManager(nil, []string{"*.tmp", "cache/**"}, "/tmp/test", config.ScopeFull)
 
 	if !m.HasExclude("*.tmp") {
 		t.Error("Should have exclude '*.tmp'")
@@ -255,7 +258,7 @@ func TestIntegrationWorkflow(t *testing.T) {
 	}
 
 	// Start fresh
-	m := NewManager(nil, nil, claudeDir)
+	m := NewManager(nil, nil, claudeDir, config.ScopeFull)
 
 	// 1. Remove a default path
 	result := m.Remove("history.jsonl")
@@ -273,7 +276,7 @@ func TestIntegrationWorkflow(t *testing.T) {
 	// 2. Simulate re-adding with the saved state (like after config reload)
 	// This simulates: user removed history.jsonl, config was saved with
 	// modified syncPaths (without history.jsonl) and excludes (with history.jsonl)
-	m = NewManager(currentPaths, currentExcludes, claudeDir)
+	m = NewManager(currentPaths, currentExcludes, claudeDir, config.ScopeFull)
 
 	// Verify history.jsonl is NOT in sync paths but IS in excludes
 	if m.HasPath("history.jsonl") {

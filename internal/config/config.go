@@ -94,6 +94,7 @@ var SyncPaths = []string{
 	"tasks",
 	"history.jsonl",
 	"rules",
+	"workflows",
 }
 
 // SessionSyncPaths is the subset synced in the "sessions" scope: portable,
@@ -261,11 +262,48 @@ func (c *Config) IsLegacyConfig() bool {
 
 // GetEffectiveSyncPaths returns the paths to sync: custom SyncPaths if set,
 // otherwise the scope-based defaults.
+//
+// Scope is a ceiling, not merely a default. Under ScopeSessions the custom list
+// is intersected with SessionSyncPaths so a sync_paths entry can never widen a
+// sessions-scoped config back into non-portable trees like plugins/ (which
+// bundles node_modules and .venv). Under "full" scope the custom list wins
+// outright, since there is nothing narrower to protect.
+//
+// This matters because `claude-sync paths add|remove` materializes the entire
+// default path list into SyncPaths, so most configs carrying a sync_paths block
+// never explicitly opted into one.
+//
+// The result is never empty: an empty set would make DetectChanges observe zero
+// local files and report every tracked file as a deletion, wiping the remote on
+// the next push. If a custom list shares nothing with the scope, the scope
+// defaults are used instead.
 func (c *Config) GetEffectiveSyncPaths() []string {
-	if len(c.SyncPaths) > 0 {
+	scoped := ScopedSyncPaths(c.Scope)
+	if len(c.SyncPaths) == 0 {
+		return scoped
+	}
+
+	if c.Scope != ScopeSessions {
 		return c.SyncPaths
 	}
-	return ScopedSyncPaths(c.Scope)
+
+	allowed := make(map[string]struct{}, len(scoped))
+	for _, p := range scoped {
+		allowed[p] = struct{}{}
+	}
+
+	// Preserve the user's ordering, keeping only in-scope entries.
+	within := make([]string, 0, len(c.SyncPaths))
+	for _, p := range c.SyncPaths {
+		if _, ok := allowed[p]; ok {
+			within = append(within, p)
+		}
+	}
+
+	if len(within) == 0 {
+		return scoped
+	}
+	return within
 }
 
 // IsMCPSyncEnabled returns true if MCP sync is explicitly enabled.

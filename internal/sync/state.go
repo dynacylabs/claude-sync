@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -216,6 +217,17 @@ func HashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+// isWithin reports whether target is root itself or lives underneath it.
+// Both are cleaned first so ".." segments cannot slip through.
+func isWithin(root, target string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(target))
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../"))
+}
+
 func GetLocalFiles(claudeDir string, syncPaths []string, excludeFn ...func(string) bool) (map[string]os.FileInfo, error) {
 	files := make(map[string]os.FileInfo)
 
@@ -227,6 +239,13 @@ func GetLocalFiles(claudeDir string, syncPaths []string, excludeFn ...func(strin
 
 	for _, syncPath := range syncPaths {
 		fullPath := filepath.Join(claudeDir, syncPath)
+
+		// Sync paths are user-configurable via sync_paths, so a traversing
+		// entry could otherwise walk outside the sync root and turn files like
+		// ~/.ssh/id_rsa into remote objects. Skip anything that escapes.
+		if !isWithin(claudeDir, fullPath) {
+			continue
+		}
 
 		info, err := os.Stat(fullPath)
 		if os.IsNotExist(err) {
