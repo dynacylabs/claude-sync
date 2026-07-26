@@ -1,3 +1,10 @@
+# [1.17.0](https://github.com/tawanorg/claude-sync/compare/v1.16.0...v1.17.0) (2026-07-26)
+
+
+### Features
+
+* apply sync_paths override with scope as a hard ceiling ([#65](https://github.com/tawanorg/claude-sync/issues/65)) ([291aadf](https://github.com/tawanorg/claude-sync/commit/291aadf6b99ed5b32aa1d2b043947e8c4107fd53)), closes [#64](https://github.com/tawanorg/claude-sync/issues/64)
+
 # [1.16.0](https://github.com/tawanorg/claude-sync/compare/v1.15.0...v1.16.0) (2026-07-21)
 
 
