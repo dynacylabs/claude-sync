@@ -35,3 +35,6 @@ testdata/
 !package.json
 !README.md
 !LICENSE
+
+# JS tests (not shipped)
+*.test.js

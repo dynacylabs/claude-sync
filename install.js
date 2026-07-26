@@ -6,7 +6,13 @@ const fs = require("fs");
 const path = require("path");
 
 const REPO = "tawanorg/claude-sync";
-const ALLOWED_HOSTS = ["github.com", "objects.githubusercontent.com"];
+// Release downloads start at github.com and redirect to a GitHub-run asset CDN.
+// That CDN host is not stable — it was objects.githubusercontent.com and is now
+// release-assets.githubusercontent.com — so pinning exact hostnames breaks the
+// installer whenever GitHub moves it. Match the githubusercontent.com parent
+// domain instead, which stays scoped to GitHub-controlled hosts.
+const ALLOWED_HOSTS = ["github.com", "api.github.com"];
+const ALLOWED_HOST_SUFFIX = ".githubusercontent.com";
 const MAX_REDIRECTS = 5;
 
 function getPlatform() {
@@ -89,7 +95,17 @@ function getChecksumsUrl(version) {
 function isAllowedHost(url) {
   try {
     const parsed = new URL(url);
-    return ALLOWED_HOSTS.includes(parsed.hostname);
+    // https only: without this an http:// redirect to an allowed host would
+    // downgrade the transport and defeat the checksum's purpose.
+    if (parsed.protocol !== "https:") {
+      return false;
+    }
+    if (ALLOWED_HOSTS.includes(parsed.hostname)) {
+      return true;
+    }
+    // Suffix match, not endsWith on the bare domain: "evilgithubusercontent.com"
+    // must not pass, so the leading dot is required.
+    return parsed.hostname.endsWith(ALLOWED_HOST_SUFFIX);
   } catch {
     return false;
   }
@@ -222,12 +238,50 @@ function hashFile(filePath) {
   });
 }
 
+// Platform-specific packages ship the binary as an optionalDependency, which
+// installs faster and works offline. This download is the fallback for when one
+// of them is missing — a platform npm publish that failed, an install with
+// --no-optional, or a platform we have not packaged. Both paths write to the
+// same place bin/claude-sync.js looks, so either satisfies the wrapper.
+const PLATFORM_PACKAGES = {
+  "darwin-arm64": "@tawandotorg/claude-sync-darwin-arm64",
+  "darwin-x64": "@tawandotorg/claude-sync-darwin-x64",
+  "linux-arm64": "@tawandotorg/claude-sync-linux-arm64",
+  "linux-x64": "@tawandotorg/claude-sync-linux-x64",
+  "win32-arm64": "@tawandotorg/claude-sync-win32-arm64",
+  "win32-x64": "@tawandotorg/claude-sync-win32-x64",
+};
+
+// platformPackageBinary returns the path to a binary already provided by the
+// matching optionalDependency, or null when none is installed.
+function platformPackageBinary() {
+  const packageName = PLATFORM_PACKAGES[`${process.platform}-${process.arch}`];
+  if (!packageName) {
+    return null;
+  }
+
+  try {
+    const packageDir = path.dirname(require.resolve(`${packageName}/package.json`));
+    const binaryName = process.platform === "win32" ? "claude-sync.exe" : "claude-sync";
+    const binaryPath = path.join(packageDir, binaryName);
+    return fs.existsSync(binaryPath) ? binaryPath : null;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function install() {
   const binDir = path.join(__dirname, "bin");
   const platform = getPlatform();
   const binaryName = platform === "windows" ? "claude-sync.exe" : "claude-sync";
   const binaryPath = path.join(binDir, binaryName);
   const assetName = getBinaryName();
+
+  const fromPackage = platformPackageBinary();
+  if (fromPackage) {
+    console.log(`✓ Using platform package binary: ${fromPackage}`);
+    return;
+  }
 
   // Create bin directory
   if (!fs.existsSync(binDir)) {
