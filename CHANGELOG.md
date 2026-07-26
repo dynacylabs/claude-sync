@@ -1,3 +1,10 @@
+## [1.17.1](https://github.com/tawanorg/claude-sync/compare/v1.17.0...v1.17.1) (2026-07-26)
+
+
+### Bug Fixes
+
+* **npm:** repair broken publish pipeline and installer fallback ([#67](https://github.com/tawanorg/claude-sync/issues/67)) ([0911b2a](https://github.com/tawanorg/claude-sync/commit/0911b2a6bf8a2afbc0c835b00cf0f13a3b109b98))
+
 # [1.17.0](https://github.com/tawanorg/claude-sync/compare/v1.16.0...v1.17.0) (2026-07-26)
 
 
