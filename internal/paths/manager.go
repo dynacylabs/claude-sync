@@ -3,26 +3,46 @@
 package paths
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/tawanorg/claude-sync/internal/config"
 )
 
-// DefaultSyncPaths are the built-in paths synced by default.
-var DefaultSyncPaths = []string{
-	"CLAUDE.md",
-	"settings.json",
-	"settings.local.json",
-	"agents",
-	"commands",
-	"skills",
-	"plugins",
-	"projects",
-	"plans",
-	"tasks",
-	"history.jsonl",
-	"rules",
-	"workflows",
+// DefaultSyncPaths returns the built-in paths synced by default for the given
+// scope. It delegates to config so the paths shown by the CLI can never drift
+// from the paths the syncer actually walks — the two lists were maintained
+// separately before, which left workflows/ advertised but never synced and made
+// `paths list` report full-scope defaults to sessions-scoped users.
+func DefaultSyncPaths(scope string) []string {
+	return config.ScopedSyncPaths(scope)
+}
+
+// ValidatePath rejects sync path entries that would escape ~/.claude.
+//
+// Sync paths were a hardcoded constant until the sync_paths override was wired
+// up, so nothing validated them. They are now user-supplied input that becomes
+// a filesystem walk root on push and a write target on pull, where a traversing
+// entry would read and write outside the sync root.
+func ValidatePath(path string) error {
+	if strings.TrimSpace(path) == "" {
+		return fmt.Errorf("path cannot be empty")
+	}
+	if filepath.IsAbs(path) || strings.HasPrefix(path, "/") {
+		return fmt.Errorf("path must be relative to ~/.claude, got absolute path %q", path)
+	}
+	if vol := filepath.VolumeName(path); vol != "" {
+		return fmt.Errorf("path must be relative to ~/.claude, got %q", path)
+	}
+
+	// Clean resolves ".." segments; anything still climbing escapes the root.
+	cleaned := filepath.ToSlash(filepath.Clean(path))
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return fmt.Errorf("path %q escapes ~/.claude", path)
+	}
+	return nil
 }
 
 // Manager handles sync path and exclude filter operations.
@@ -31,32 +51,38 @@ type Manager struct {
 	syncPaths  []string
 	excludes   []string
 	claudeDir  string
+	scope      string
 	defaultSet map[string]struct{}
 }
 
 // NewManager creates a Manager with the given paths and excludes.
-// If claudeDir is empty, it defaults to ~/.claude.
-func NewManager(syncPaths, excludes []string, claudeDir string) *Manager {
+// If claudeDir is empty, it defaults to ~/.claude. The scope determines which
+// path set counts as "default", so a sessions-scoped config is not shown or
+// reset against the full-scope list.
+func NewManager(syncPaths, excludes []string, claudeDir, scope string) *Manager {
 	if claudeDir == "" {
 		home, _ := os.UserHomeDir()
 		claudeDir = filepath.Join(home, ".claude")
 	}
 
+	defaults := DefaultSyncPaths(scope)
+
 	// Build default set for quick lookup
-	defaultSet := make(map[string]struct{}, len(DefaultSyncPaths))
-	for _, p := range DefaultSyncPaths {
+	defaultSet := make(map[string]struct{}, len(defaults))
+	for _, p := range defaults {
 		defaultSet[p] = struct{}{}
 	}
 
 	// Use defaults if no custom paths
 	if len(syncPaths) == 0 {
-		syncPaths = append([]string{}, DefaultSyncPaths...)
+		syncPaths = append([]string{}, defaults...)
 	}
 
 	return &Manager{
 		syncPaths:  syncPaths,
 		excludes:   excludes,
 		claudeDir:  claudeDir,
+		scope:      scope,
 		defaultSet: defaultSet,
 	}
 }
@@ -77,6 +103,11 @@ type AddResult struct {
 	AlreadyExists   bool
 	PathMissing     bool
 	ExcludesRemoved int
+	// Invalid is set when the path escapes ~/.claude; nothing was changed.
+	Invalid error
+	// OutOfScope is set when the path is not reachable under the current
+	// sessions scope, so it would be filtered out before reaching the syncer.
+	OutOfScope bool
 }
 
 // Add adds a path to the sync list.
@@ -84,6 +115,21 @@ type AddResult struct {
 // Returns details about what changed.
 func (m *Manager) Add(path string) AddResult {
 	result := AddResult{}
+
+	if err := ValidatePath(path); err != nil {
+		result.Invalid = err
+		return result
+	}
+
+	// A sessions-scoped config intersects sync_paths with SessionSyncPaths, so
+	// an out-of-scope entry would be silently dropped at sync time. Report it
+	// here rather than writing config the syncer will ignore.
+	if m.scope == config.ScopeSessions {
+		if _, inScope := m.defaultSet[path]; !inScope {
+			result.OutOfScope = true
+			return result
+		}
+	}
 
 	// Check if already in list
 	for _, p := range m.syncPaths {
@@ -244,7 +290,7 @@ func (m *Manager) RemoveExclude(pattern string) RemoveExcludeResult {
 
 // Reset restores default sync paths and clears all excludes.
 func (m *Manager) Reset() {
-	m.syncPaths = append([]string{}, DefaultSyncPaths...)
+	m.syncPaths = append([]string{}, DefaultSyncPaths(m.scope)...)
 	m.excludes = nil
 }
 

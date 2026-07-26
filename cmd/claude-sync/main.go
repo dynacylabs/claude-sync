@@ -1147,7 +1147,7 @@ Examples:
 
 			// Check for first pull with existing local files
 			if !syncer.HasState() {
-				hasExisting, err := hasExistingClaudeFiles(cfg.Scope)
+				hasExisting, err := hasExistingClaudeFiles(cfg)
 				if err != nil {
 					return err
 				}
@@ -2287,13 +2287,13 @@ func clearRemoteStorage(ctx context.Context, store storage.Storage) error {
 }
 
 // hasExistingClaudeFiles checks if ~/.claude has any files that would be synced
-func hasExistingClaudeFiles(scope string) (bool, error) {
+func hasExistingClaudeFiles(cfg *config.Config) (bool, error) {
 	claudeDir := config.ClaudeDir()
 	if _, err := os.Stat(claudeDir); os.IsNotExist(err) {
 		return false, nil
 	}
 
-	files, err := sync.GetLocalFiles(claudeDir, config.ScopedSyncPaths(scope))
+	files, err := sync.GetLocalFiles(claudeDir, cfg.GetEffectiveSyncPaths())
 	if err != nil {
 		return false, err
 	}
@@ -2377,7 +2377,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 	switch choice {
 	case 0:
 		// Backup and proceed
-		backupDir, err := createBackup(syncer.Scope())
+		backupDir, err := createBackup(syncer.SyncPaths())
 		if err != nil {
 			return fmt.Errorf("failed to create backup: %w", err)
 		}
@@ -2398,7 +2398,7 @@ func handleFirstPullWithExistingFiles(ctx context.Context, syncer *sync.Syncer, 
 }
 
 // createBackup creates a backup of the current ~/.claude directory
-func createBackup(scope string) (string, error) {
+func createBackup(syncPaths []string) (string, error) {
 	claudeDir := config.ClaudeDir()
 	timestamp := time.Now().Format("20060102-150405")
 	backupDir := claudeDir + ".backup." + timestamp
@@ -2409,7 +2409,7 @@ func createBackup(scope string) (string, error) {
 	}
 
 	// Copy all syncable files to backup
-	files, err := sync.GetLocalFiles(claudeDir, config.ScopedSyncPaths(scope))
+	files, err := sync.GetLocalFiles(claudeDir, syncPaths)
 	if err != nil {
 		return "", fmt.Errorf("failed to list files: %w", err)
 	}
@@ -3187,7 +3187,7 @@ func runPathsList() error {
 		return err
 	}
 
-	mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+	mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir(), cfg.Scope)
 	status := mgr.Status()
 
 	source := "default"
@@ -3195,13 +3195,41 @@ func runPathsList() error {
 		source = "config.yaml"
 	}
 
-	fmt.Printf("\n%sSync Paths%s (%s):\n", colorBold, colorReset, source)
+	scopeLabel := cfg.Scope
+	if scopeLabel == "" {
+		scopeLabel = config.ScopeFull
+	}
+
+	// List what actually syncs, not the raw config list. Under sessions scope
+	// the effective set is the intersection with SessionSyncPaths, so showing
+	// cfg.SyncPaths verbatim would advertise paths that are never uploaded.
+	effective := make(map[string]struct{})
+	for _, p := range cfg.GetEffectiveSyncPaths() {
+		effective[p] = struct{}{}
+	}
+
+	var outOfScope []string
+
+	fmt.Printf("\n%sSync Paths%s (%s, scope: %s):\n", colorBold, colorReset, source, scopeLabel)
 	for _, p := range status.SyncPaths {
+		if _, ok := effective[p]; !ok {
+			outOfScope = append(outOfScope, p)
+			continue
+		}
 		marker := colorGreen + "+" + colorReset
 		if !mgr.IsDefault(p) {
 			marker = colorCyan + "+" + colorReset + " (custom)"
 		}
 		fmt.Printf("  %s %s\n", marker, p)
+	}
+
+	if len(outOfScope) > 0 {
+		fmt.Printf("\n%sNot synced%s (outside the %q scope):\n", colorBold, colorReset, scopeLabel)
+		for _, p := range outOfScope {
+			fmt.Printf("  %s-%s %s\n", colorYellow, colorReset, p)
+		}
+		fmt.Printf("\n  These remain in config.yaml and apply again if scope is set to %q.\n",
+			config.ScopeFull)
 	}
 
 	if len(status.Excludes) > 0 {
@@ -3230,8 +3258,20 @@ conflicting exclude is automatically removed.`,
 				return err
 			}
 
-			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir(), cfg.Scope)
 			result := mgr.Add(args[0])
+
+			if result.Invalid != nil {
+				return fmt.Errorf("invalid sync path: %w", result.Invalid)
+			}
+
+			if result.OutOfScope {
+				fmt.Printf("%s!%s %s is outside the %q scope and would not be synced\n",
+					colorYellow, colorReset, args[0], config.ScopeSessions)
+				fmt.Printf("  Set %sscope: full%s in %s to sync paths beyond session data.\n",
+					colorCyan, colorReset, config.ConfigFilePath())
+				return nil
+			}
 
 			if result.AlreadyExists {
 				fmt.Printf("%s!%s %s is already in the sync list\n", colorYellow, colorReset, args[0])
@@ -3273,7 +3313,7 @@ Custom paths are simply removed from the list.`,
 				return err
 			}
 
-			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir(), cfg.Scope)
 
 			if !mgr.HasPath(args[0]) {
 				fmt.Printf("%s!%s %s is not in the sync list\n", colorYellow, colorReset, args[0])
@@ -3327,7 +3367,7 @@ Glob syntax: dir/*, dir/**, **/*.ext`,
 				return err
 			}
 
-			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir(), cfg.Scope)
 			result := mgr.AddExclude(args[0])
 
 			if result.IsSyncPath {
@@ -3363,7 +3403,7 @@ func pathsUnexcludeCmd() *cobra.Command {
 				return err
 			}
 
-			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir())
+			mgr := paths.NewManager(cfg.SyncPaths, cfg.Exclude, config.ClaudeDir(), cfg.Scope)
 			result := mgr.RemoveExclude(args[0])
 
 			if result.NotFound {

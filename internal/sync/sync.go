@@ -149,15 +149,23 @@ func (s *Syncer) isExcluded(relPath string) bool {
 	return s.cfg.IsExcluded(relPath)
 }
 
-// syncPaths returns the set of ~/.claude paths to sync, honoring the
-// configured scope ("full" by default, or "sessions" for portable data only).
+// syncPaths returns the set of ~/.claude paths to sync, honoring both the
+// configured scope ("full" by default, or "sessions" for portable data only)
+// and any sync_paths override, with scope acting as a ceiling.
 func (s *Syncer) syncPaths() []string {
-	return config.ScopedSyncPaths(s.cfg.Scope)
+	return s.cfg.GetEffectiveSyncPaths()
 }
 
 // Scope returns the configured sync scope (empty means the default "full").
 func (s *Syncer) Scope() string {
 	return s.cfg.Scope
+}
+
+// SyncPaths returns the effective ~/.claude paths this syncer operates on, so
+// callers such as the pre-pull backup cover exactly the set that pull can
+// overwrite rather than recomputing it from scope alone.
+func (s *Syncer) SyncPaths() []string {
+	return s.syncPaths()
 }
 
 func (s *Syncer) log(format string, args ...interface{}) {
