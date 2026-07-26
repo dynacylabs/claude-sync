@@ -56,9 +56,11 @@ jobs:
             GOOS=windows GOARCH=arm64 go build -ldflags "$LDFLAGS" -o bin/claude-sync-windows-arm64.exe ./cmd/claude-sync
           fi
 
+      # Not continue-on-error: a silent npm publish failure left the registry
+      # 9 minor versions behind the git tags for 16 weeks. A failed publish must
+      # fail the release.
       - name: Publish platform packages to npm
         if: success()
-        continue-on-error: true
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |

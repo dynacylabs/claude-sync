@@ -12,6 +12,12 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 NPM_DIR="$ROOT_DIR/npm"
 
+# Platform packages that failed to publish, reported at the end so one bad
+# platform does not hide the others or block the root package. Kept as a plain
+# string rather than an array: this script runs under `set -u`, where expanding
+# an empty array is an error on some bash versions.
+FAILED_PLATFORMS=""
+
 # Map: npm platform → Go binary name
 declare -A PLATFORM_MAP=(
   ["darwin-arm64"]="claude-sync-darwin-arm64"
@@ -54,8 +60,18 @@ for platform in "${!PLATFORM_MAP[@]}"; do
   # Update version in package.json
   cd "$pkg_dir"
   npm version "$VERSION" --no-git-tag-version --allow-same-version 2>/dev/null
-  npm publish --access public
-  echo "  Published!"
+
+  # A platform publish must not abort the run. The root package carries a
+  # postinstall that downloads the binary from GitHub Releases, so it is still
+  # worth publishing even when a platform package fails — users fall back
+  # instead of getting nothing. Failures are collected and re-raised at the end
+  # so CI still goes red.
+  if npm publish --access public; then
+    echo "  Published!"
+  else
+    echo "  ERROR: failed to publish @tawandotorg/claude-sync-${platform}@${VERSION}"
+    FAILED_PLATFORMS="$FAILED_PLATFORMS $platform"
+  fi
 
   # Clean up binary (don't commit binaries)
   rm -f "$pkg_dir/$dst_binary"
@@ -72,5 +88,23 @@ done
 rm -f package.json.bak
 
 npm version "$VERSION" --no-git-tag-version --allow-same-version 2>/dev/null
-npm publish --access public
-echo "Published @tawandotorg/claude-sync@${VERSION}!"
+
+ROOT_FAILED=0
+if npm publish --access public; then
+  echo "Published @tawandotorg/claude-sync@${VERSION}!"
+else
+  echo "ERROR: failed to publish @tawandotorg/claude-sync@${VERSION}"
+  ROOT_FAILED=1
+fi
+
+if [ -n "$FAILED_PLATFORMS" ]; then
+  echo
+  echo "Platform packages that failed to publish:$FAILED_PLATFORMS"
+  echo "A 404 on PUT for a package that has never been published usually means"
+  echo "NPM_TOKEN cannot create new packages in the @tawandotorg scope — grant"
+  echo "the token read/write on the whole scope, not just existing packages."
+fi
+
+if [ -n "$FAILED_PLATFORMS" ] || [ "$ROOT_FAILED" -eq 1 ]; then
+  exit 1
+fi

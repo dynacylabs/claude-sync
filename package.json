@@ -5,6 +5,10 @@
   "bin": {
     "claude-sync": "./bin/claude-sync.js"
   },
+  "scripts": {
+    "postinstall": "node install.js",
+    "test": "node --test"
+  },
   "keywords": [
     "claude",
     "claude-code",
