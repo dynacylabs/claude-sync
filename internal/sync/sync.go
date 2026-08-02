@@ -409,7 +409,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 						switch res {
 						case jsonlEqual, jsonlLocalAhead:
 							continue
-						case jsonlFastForwarded:
+						case jsonlFastForwarded, jsonlMerged:
 							result.Downloaded = append(result.Downloaded, localPath)
 							s.progress(ProgressEvent{Action: "download", Path: localPath, Size: remoteObj.Size})
 							continue
@@ -739,6 +739,7 @@ const (
 	jsonlEqual                                // same bytes: state refreshed, nothing written
 	jsonlFastForwarded                        // local extended with the remote's missing tail
 	jsonlLocalAhead                           // local kept; the next push publishes it
+	jsonlMerged                               // diverged transcripts united by MergeSessionPayloads
 )
 
 // resolveJSONLConflict re-examines an apparent both-sides-changed conflict on
@@ -824,6 +825,39 @@ func (s *Syncer) resolveJSONLConflict(ctx context.Context, relativePath string, 
 		// machine. Keep local and leave state untouched so the next push
 		// publishes it. A .conflict copy of a stale prefix is pure noise.
 		return jsonlLocalAhead, nil
+
+	case PrefixNone:
+		// Genuinely diverged: the same session advanced on two machines.
+		// Union-merge by APPENDING what the remote has that local lacks
+		// (MergeSessionPayloads never rewrites local). Whose mutable state
+		// wins is decided by file-level times — the records themselves carry
+		// no timestamp to order by. LastModified is upload time and lags the
+		// remote write by up to one push delay, so near-ties resolve in
+		// remote's favour — a bounded, self-correcting bias (stale state
+		// until the next local state write). Any merge failure degrades to
+		// the legacy keep-local-plus-.conflict path rather than blocking the
+		// pull.
+		info, statErr := os.Stat(fullPath)
+		if statErr != nil {
+			return jsonlConflict, statErr
+		}
+		localNewer := info.ModTime().After(remoteObj.LastModified)
+		added, merr := MergeSessionPayloads(local, remote, localNewer)
+		if merr != nil {
+			return jsonlConflict, nil
+		}
+		if len(added) == 0 {
+			// Local already carries everything the remote has. Keep it; state
+			// stays untouched so the next push publishes the union.
+			return jsonlLocalAhead, nil
+		}
+		if aerr := appendHistoryLines(fullPath, added); aerr != nil {
+			return jsonlConflict, nil
+		}
+		// State intentionally untouched (same convention as pullMergeHistory):
+		// the local hash now differs from the last-uploaded hash, so the next
+		// push publishes the union.
+		return jsonlMerged, nil
 	}
 	return jsonlConflict, nil
 }

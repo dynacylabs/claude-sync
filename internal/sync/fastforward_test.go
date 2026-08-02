@@ -148,25 +148,46 @@ func TestPullKeepsLocalWhenAheadWithoutConflictFile(t *testing.T) {
 	}
 }
 
-func TestPullDivergedJSONLStillConflicts(t *testing.T) {
+func TestPullMergesDivergedSessionInsteadOfConflict(t *testing.T) {
 	env := setupTestEnv(t)
-	base := "{\"uuid\":\"u1\"}\n"
-	local := base + "{\"uuid\":\"b\"}\n"
-	remote := base + "{\"uuid\":\"c\"}\n"
+	base := `{"uuid":"a","type":"user"}` + "\n"
+	local := base + `{"uuid":"b","type":"assistant","parentUuid":"a"}` + "\n"
+	remote := base + `{"uuid":"c","type":"assistant","parentUuid":"a"}` + "\n"
 	pushThenDesync(t, env, "projects/p1/sess.jsonl", base, local, remote)
 
 	result, err := env.syncer.Pull(context.Background())
 	if err != nil {
 		t.Fatalf("Pull failed: %v", err)
 	}
-	if len(result.Conflicts) != 1 {
-		t.Fatalf("a genuine divergence must still conflict, got %v", result.Conflicts)
+	if len(result.Conflicts) != 0 {
+		t.Errorf("diverged session should merge, not conflict: %v", result.Conflicts)
 	}
-	if got := readFile(t, env.claudeDir, "projects/p1/sess.jsonl"); got != local {
-		t.Errorf("local must be kept on a real conflict, got %q", got)
+	got := readFile(t, env.claudeDir, "projects/p1/sess.jsonl")
+	if !strings.HasPrefix(got, local) {
+		t.Errorf("local content must be preserved verbatim as prefix, got %q", got)
 	}
-	if cf := conflictFilesIn(t, env.claudeDir); len(cf) != 1 {
-		t.Errorf("expected exactly one .conflict file, got %v", cf)
+	if !strings.Contains(got, `"uuid":"c"`) {
+		t.Errorf("remote-only event missing after merge, got %q", got)
+	}
+	if cf := conflictFilesIn(t, env.claudeDir); len(cf) != 0 {
+		t.Errorf(".conflict written for a mergeable divergence: %v", cf)
+	}
+	if len(result.Downloaded) != 1 {
+		t.Errorf("merge should count as downloaded, got %v", result.Downloaded)
+	}
+
+	// Applied idempotency at the pull level: a second pull must be a no-op
+	// for this file (no new conflicts, no duplicate appends).
+	before := readFile(t, env.claudeDir, "projects/p1/sess.jsonl")
+	result2, err := env.syncer.Pull(context.Background())
+	if err != nil {
+		t.Fatalf("second Pull failed: %v", err)
+	}
+	if len(result2.Conflicts) != 0 {
+		t.Errorf("second pull must not conflict, got %v", result2.Conflicts)
+	}
+	if after := readFile(t, env.claudeDir, "projects/p1/sess.jsonl"); after != before {
+		t.Errorf("second pull changed the file:\nbefore %q\nafter  %q", before, after)
 	}
 }
 
