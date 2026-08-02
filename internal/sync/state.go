@@ -364,6 +364,12 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeF
 	s.mu.Unlock()
 
 	for _, relPath := range knownPaths {
+		// Desktop session records are tracked in state but live outside
+		// claudeDir — they are never local files here, and their bucket copies
+		// must never be deleted (the registry only grows, like history).
+		if strings.HasPrefix(relPath, CCDSessionsPrefix) {
+			continue
+		}
 		if _, exists := localFiles[relPath]; !exists {
 			changes = append(changes, FileChange{
 				Path:   relPath,

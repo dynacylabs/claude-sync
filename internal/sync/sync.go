@@ -68,6 +68,20 @@ type Syncer struct {
 	onProgress ProgressFunc
 	cfg        *config.Config
 	paths      *PathMapper
+	ccdDir     string // desktop-app session store override (tests inject a temp dir)
+}
+
+// uploadEncoded compresses, encrypts, and uploads raw bytes to a remote key.
+func (s *Syncer) uploadEncoded(ctx context.Context, key string, data []byte) error {
+	compressed, err := gzipCompress(data)
+	if err != nil {
+		return fmt.Errorf("failed to compress: %w", err)
+	}
+	encrypted, err := s.encryptor.Encrypt(compressed)
+	if err != nil {
+		return fmt.Errorf("failed to encrypt: %w", err)
+	}
+	return s.storage.Upload(ctx, key, encrypted)
 }
 
 type SyncResult struct {
@@ -211,6 +225,13 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 
 	if len(changes) == 0 {
 		s.progress(ProgressEvent{Action: "scan", Complete: true})
+		// Desktop-only changes (rename/archive/new app session) touch no
+		// ~/.claude file, so records must still publish on an otherwise
+		// no-op push.
+		s.pushCCDSessions(ctx, result)
+		if err := s.state.Save(); err != nil {
+			return result, fmt.Errorf("failed to save state: %w", err)
+		}
 		return result, nil
 	}
 
@@ -314,6 +335,10 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 			s.log("Warning: failed to upload manifest: %v", err)
 		}
 	}
+
+	// Sync desktop-app session records BEFORE saving state — their state
+	// entries must persist or every future hook re-transfers every record.
+	s.pushCCDSessions(ctx, result)
 
 	s.state.LastPush = time.Now()
 	s.state.LastSync = time.Now()
@@ -490,6 +515,10 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	}
 
 	s.progress(ProgressEvent{Action: "download", Complete: true, Total: total})
+
+	// Sync desktop-app session records BEFORE saving state (their entries must
+	// persist to avoid re-fetching every record on every pull).
+	s.pullCCDSessions(ctx, result)
 
 	s.state.LastPull = time.Now()
 	s.state.LastSync = time.Now()

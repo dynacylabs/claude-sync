@@ -101,7 +101,8 @@ func (m *mockStorage) BucketExists(_ context.Context) (bool, error) {
 	return true, nil
 }
 
-// ListUserObjects returns objects excluding metadata (_metadata/) and external (_external/) files.
+// ListUserObjects returns objects excluding metadata (_metadata/), external
+// (_external/), and desktop session-record (_ccd-sessions/) files.
 // Use this in tests to count only actual synced user files.
 func (m *mockStorage) ListUserObjects(ctx context.Context) ([]storage.ObjectInfo, error) {
 	objs, err := m.List(ctx, "")
@@ -110,7 +111,8 @@ func (m *mockStorage) ListUserObjects(ctx context.Context) ([]storage.ObjectInfo
 	}
 	var result []storage.ObjectInfo
 	for _, obj := range objs {
-		if strings.HasPrefix(obj.Key, "_metadata/") || strings.HasPrefix(obj.Key, "_external/") {
+		if strings.HasPrefix(obj.Key, "_metadata/") || strings.HasPrefix(obj.Key, "_external/") ||
+			strings.HasPrefix(obj.Key, CCDSessionsPrefix) {
 			continue
 		}
 		result = append(result, obj)
