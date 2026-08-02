@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -32,6 +33,12 @@ const maxDecompressedSize = 500 * 1024 * 1024
 
 // ManifestKey is the remote storage key for file metadata (mtimes).
 const ManifestKey = "_metadata/manifest.json"
+
+// errSkipUpload is returned by uploadFile when the shrink guard declines to
+// upload a truncated session transcript. Push treats it as neither an upload
+// nor an error: it is deliberate inaction, and reporting it as a failure would
+// make every push look broken while a machine waits for its next pull.
+var errSkipUpload = errors.New("upload skipped: local copy is behind the bucket copy")
 
 // FileManifest stores metadata about synced files, primarily mtimes.
 type FileManifest struct {
@@ -226,6 +233,11 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 				})
 
 				if err := s.uploadFile(ctx, change.Path); err != nil {
+					if errors.Is(err, errSkipUpload) {
+						// Deliberate inaction, not a failure: the file is
+						// neither uploaded nor errored.
+						return
+					}
 					s.progress(ProgressEvent{
 						Action: "upload",
 						Path:   change.Path,
@@ -333,6 +345,26 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 				// Check if local was also modified
 				localHash, _ := HashFile(filepath.Join(s.claudeDir, localPath))
 				if localHash != stateFile.Hash {
+					// Both sides changed since the last sync. For append-only
+					// session transcripts that usually means one side is
+					// simply ahead — a fast-forward, not a conflict. Compare
+					// the bytes before declaring one (resolveJSONLConflict).
+					if isSessionJSONL(localPath) {
+						res, rerr := s.resolveJSONLConflict(ctx, localPath, remoteObj)
+						if rerr != nil {
+							result.Errors = append(result.Errors, fmt.Errorf("%s: %w", localPath, rerr))
+							continue
+						}
+						switch res {
+						case jsonlEqual, jsonlLocalAhead:
+							continue
+						case jsonlFastForwarded:
+							result.Downloaded = append(result.Downloaded, localPath)
+							s.progress(ProgressEvent{Action: "download", Path: localPath, Size: remoteObj.Size})
+							continue
+						}
+						// jsonlConflict falls through to the standard path.
+					}
 					// Conflict: both changed
 					result.Conflicts = append(result.Conflicts, localPath)
 					s.progress(ProgressEvent{
@@ -430,6 +462,27 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
+	// A session transcript that SHRANK since the last push is far more likely
+	// a truncated copy (partial restore, torn sync) than a real rewrite — and
+	// uploading it would clobber the fuller bucket copy for every machine.
+	// When local is a (possibly equal) prefix of the current remote, skip the
+	// upload; the next pull fast-forwards local instead. State is left
+	// untouched so the file is re-examined on the next push. The remote
+	// round-trip is paid only in the shrunk case, and any fetch error
+	// (not-found included) falls through to a normal upload — this guard must
+	// never turn a push into a hard failure.
+	if isSessionJSONL(relativePath) {
+		if st := s.state.GetFile(relativePath); st != nil && int64(len(data)) < st.Size {
+			if remote, ferr := s.fetchDecoded(ctx, relativePath, s.remoteKey(relativePath)); ferr == nil {
+				switch ClassifyPrefix(data, remote) {
+				case PrefixEqual, PrefixRemoteAhead:
+					s.log("Skipping upload of %s: local copy is behind the bucket copy", relativePath)
+					return errSkipUpload
+				}
+			}
+		}
+	}
+
 	// Replace machine-specific paths with portable tokens in session content
 	if IsPortableContentPath(relativePath) {
 		data = s.paths.NormalizeContent(data)
@@ -462,32 +515,43 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	return nil
 }
 
-// downloadFile downloads and decrypts a file from remote storage.
-// If originalMtime is non-nil, the file's modification time will be restored to that value.
-func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey string, originalMtime *time.Time) error {
-	// Download
+// fetchDecoded downloads a remote object and returns its plaintext in LOCAL
+// form: decrypted, decompressed, and with portable tokens resolved to this
+// device's paths. Factored out of downloadFile so callers can inspect remote
+// content without writing it to disk, and so a byte comparison against the
+// local file compares like with like.
+func (s *Syncer) fetchDecoded(ctx context.Context, relativePath, remoteKey string) ([]byte, error) {
 	encrypted, err := s.storage.Download(ctx, remoteKey)
 	if err != nil {
-		return fmt.Errorf("failed to download: %w", err)
+		return nil, fmt.Errorf("failed to download: %w", err)
 	}
 
-	// Decrypt
 	data, err := s.encryptor.Decrypt(encrypted)
 	if err != nil {
-		return fmt.Errorf("failed to decrypt: %w", err)
+		return nil, fmt.Errorf("failed to decrypt: %w", err)
 	}
 
 	// Decompress if gzipped (backward-compatible with uncompressed data)
 	if isGzipped(data) {
 		data, err = gzipDecompress(data)
 		if err != nil {
-			return fmt.Errorf("failed to decompress: %w", err)
+			return nil, fmt.Errorf("failed to decompress: %w", err)
 		}
 	}
 
 	// Replace portable tokens with this device's paths in session content
 	if IsPortableContentPath(relativePath) {
 		data = s.paths.ResolveContent(data)
+	}
+	return data, nil
+}
+
+// downloadFile downloads and decrypts a file from remote storage.
+// If originalMtime is non-nil, the file's modification time will be restored to that value.
+func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey string, originalMtime *time.Time) error {
+	data, err := s.fetchDecoded(ctx, relativePath, remoteKey)
+	if err != nil {
+		return err
 	}
 
 	// Guard against path traversal from crafted remote keys
@@ -522,6 +586,104 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath, remoteKey strin
 	s.state.MarkUploaded(relativePath)
 
 	return nil
+}
+
+// jsonlResolution is the outcome of resolveJSONLConflict. jsonlConflict is the
+// zero value and is also what accompanies any error return.
+type jsonlResolution int
+
+const (
+	jsonlConflict      jsonlResolution = iota // genuinely diverged: caller runs handleConflict
+	jsonlEqual                                // same bytes: state refreshed, nothing written
+	jsonlFastForwarded                        // local extended with the remote's missing tail
+	jsonlLocalAhead                           // local kept; the next push publishes it
+)
+
+// resolveJSONLConflict re-examines an apparent both-sides-changed conflict on
+// an append-only session transcript before it is declared.
+//
+// In a 92-artifact corpus every such "conflict" was a strict byte-prefix
+// relation: one side simply ahead (an active session appending between two
+// syncs) or one side truncated (a partial restore). Writing a .conflict file
+// for those either loses nothing or, in the truncated case, parks the ONLY
+// complete copy in a file Claude Code never reads.
+//
+// The remote payload is downloaded here, but that costs nothing extra: the
+// conflict path this replaces already downloads it to write the .conflict file.
+func (s *Syncer) resolveJSONLConflict(ctx context.Context, relativePath string, remoteObj storage.ObjectInfo) (jsonlResolution, error) {
+	remote, err := s.fetchDecoded(ctx, relativePath, remoteObj.Key)
+	if err != nil {
+		return jsonlConflict, err
+	}
+	fullPath := filepath.Join(s.claudeDir, relativePath)
+	local, err := os.ReadFile(fullPath)
+	if err != nil {
+		return jsonlConflict, err
+	}
+
+	switch ClassifyPrefix(local, remote) {
+	case PrefixEqual:
+		// Same content on both sides. Refresh state so this file stops
+		// re-triggering conflict detection on every subsequent pull.
+		info, statErr := os.Stat(fullPath)
+		if statErr != nil {
+			return jsonlConflict, statErr
+		}
+		s.state.UpdateFile(relativePath, info, HashBytes(local))
+		s.state.MarkUploaded(relativePath)
+		return jsonlEqual, nil
+
+	case PrefixRemoteAhead:
+		// Remote strictly extends local (typically a truncated local copy).
+		// Append ONLY the missing tail with O_APPEND — never truncate-rewrite.
+		// If a live session appends between our read and this write, an append
+		// yields divergent ordering that the next pull classifies as a real
+		// conflict (zero bytes lost), whereas a rewrite would silently drop
+		// those lines.
+		f, oerr := os.OpenFile(fullPath, os.O_APPEND|os.O_WRONLY, 0600)
+		if oerr != nil {
+			return jsonlConflict, oerr
+		}
+		if _, werr := f.Write(remote[len(local):]); werr != nil {
+			_ = f.Close()
+			return jsonlConflict, werr
+		}
+		if cerr := f.Close(); cerr != nil {
+			return jsonlConflict, cerr
+		}
+
+		final, rerr := os.ReadFile(fullPath)
+		if rerr != nil {
+			return jsonlConflict, rerr
+		}
+		if bytes.Equal(final, remote) {
+			// Clean fast-forward: record the new content, and that the bucket
+			// already holds exactly these bytes.
+			info, statErr := os.Stat(fullPath)
+			if statErr != nil {
+				return jsonlConflict, statErr
+			}
+			s.state.UpdateFile(relativePath, info, HashBytes(final))
+			s.state.MarkUploaded(relativePath)
+		}
+		// Otherwise a live session appended during the fast-forward, so the
+		// file is local+concurrent+tail while the bucket holds local+tail.
+		// Leave state UNTOUCHED on purpose: UpdateFile resets the Uploaded
+		// timestamp, so recording the new hash would make the next pull see
+		// "local unchanged, remote newer" and rewrite the file from the
+		// bucket, silently dropping the concurrent lines. With state stale the
+		// next pull re-enters this resolver, classifies PrefixNone and writes
+		// a real .conflict file, and the next push publishes the full local
+		// file. Nothing is lost either way.
+		return jsonlFastForwarded, nil
+
+	case PrefixLocalAhead:
+		// Local strictly extends remote: the bucket is simply behind this
+		// machine. Keep local and leave state untouched so the next push
+		// publishes it. A .conflict copy of a stale prefix is pure noise.
+		return jsonlLocalAhead, nil
+	}
+	return jsonlConflict, nil
 }
 
 func (s *Syncer) handleConflict(ctx context.Context, relativePath string, remoteObj storage.ObjectInfo) error {
