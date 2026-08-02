@@ -276,16 +276,31 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 
 	// Process deletes (use batch delete if available, otherwise concurrent)
 	if len(deletes) > 0 {
-		deleteKeys := make([]string, len(deletes))
-		for i, change := range deletes {
-			deleteKeys[i] = s.remoteKey(change.Path)
-		}
-		if err := s.storage.DeleteBatch(ctx, deleteKeys); err != nil {
-			result.Errors = append(result.Errors, fmt.Errorf("batch delete: %w", err))
-		} else {
-			for _, change := range deletes {
+		// The bucket's history.jsonl is a union that only ever grows — a
+		// locally deleted history file must not delete every other machine's
+		// entries with it. Drop the state entry instead; the next pull
+		// restores the file locally.
+		var remoteDeletes []FileChange
+		for _, change := range deletes {
+			if change.Path == HistoryFile {
 				s.state.RemoveFile(change.Path)
-				result.Deleted = append(result.Deleted, change.Path)
+				continue
+			}
+			remoteDeletes = append(remoteDeletes, change)
+		}
+
+		if len(remoteDeletes) > 0 {
+			deleteKeys := make([]string, len(remoteDeletes))
+			for i, change := range remoteDeletes {
+				deleteKeys[i] = s.remoteKey(change.Path)
+			}
+			if err := s.storage.DeleteBatch(ctx, deleteKeys); err != nil {
+				result.Errors = append(result.Errors, fmt.Errorf("batch delete: %w", err))
+			} else {
+				for _, change := range remoteDeletes {
+					s.state.RemoveFile(change.Path)
+					result.Deleted = append(result.Deleted, change.Path)
+				}
 			}
 		}
 	}
@@ -351,6 +366,24 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	for localPath, remoteObj := range remoteFiles {
 		localInfo, localExists := localFiles[localPath]
 		stateFile := s.state.GetFile(localPath)
+
+		// A local history.jsonl is union-merged with the remote copy instead
+		// of being overwritten (data loss) or kept with the remote parked in a
+		// .conflict file (invisible data). Merge on first sync regardless of
+		// mtimes, and afterwards whenever the remote changed since our last
+		// upload. A missing local file falls through to the plain download.
+		if localPath == HistoryFile && localExists {
+			if stateFile == nil || remoteObj.LastModified.After(stateFile.Uploaded) {
+				changed, err := s.pullMergeHistory(ctx, localPath, remoteObj)
+				if err != nil {
+					result.Errors = append(result.Errors, fmt.Errorf("%s: %w", localPath, err))
+				} else if changed {
+					result.Downloaded = append(result.Downloaded, localPath)
+					s.progress(ProgressEvent{Action: "download", Path: localPath, Size: remoteObj.Size})
+				}
+			}
+			continue
+		}
 
 		shouldDownload := false
 
@@ -480,6 +513,18 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 		return fmt.Errorf("failed to read file: %w", err)
 	}
 
+	// history.jsonl is one file appended to by every machine, so a plain
+	// upload is last-writer-wins and silently drops the other machines'
+	// prompt-history entries. Union-merging the remote copy into the upload
+	// keeps the bucket copy a superset of every machine's history.
+	if relativePath == HistoryFile {
+		merged, err := s.mergeHistoryForPush(ctx, relativePath, fullPath, data)
+		if err != nil {
+			return err
+		}
+		data = merged
+	}
+
 	// A session transcript that SHRANK since the last push is far more likely
 	// a truncated copy (partial restore, torn sync) than a real rewrite — and
 	// uploading it would clobber the fuller bucket copy for every machine.
@@ -500,6 +545,11 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 			}
 		}
 	}
+
+	// Local-form bytes actually being uploaded; for history the state hash is
+	// computed from this instead of re-reading the file, so any line a live
+	// session appends after our read still differs from state and gets pushed.
+	localForm := data
 
 	// Replace machine-specific paths with portable tokens in session content
 	if IsPortableContentPath(relativePath) {
@@ -526,7 +576,12 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 
 	// Update state
 	info, _ := os.Stat(fullPath)
-	hash, _ := HashFile(fullPath)
+	var hash string
+	if relativePath == HistoryFile {
+		hash = HashBytes(localForm)
+	} else {
+		hash, _ = HashFile(fullPath)
+	}
 	s.state.UpdateFile(relativePath, info, hash)
 	s.state.MarkUploaded(relativePath)
 
@@ -562,6 +617,75 @@ func (s *Syncer) fetchDecoded(ctx context.Context, relativePath, remoteKey strin
 		data = s.paths.ResolveContent(data)
 	}
 	return data, nil
+}
+
+// mergeHistoryForPush returns the union of the local history payload and the
+// current remote copy. When the remote contributes entries they are APPENDED
+// to the local file (never a rewrite — a rewrite from a stale read would
+// destroy lines a live Claude Code session appends during the merge's network
+// round-trip). A missing remote object (first push) is not an error; any
+// other failure — a transient Head error included — aborts the upload rather
+// than clobbering entries that could not be merged.
+func (s *Syncer) mergeHistoryForPush(ctx context.Context, relativePath, fullPath string, local []byte) ([]byte, error) {
+	remoteKey := s.remoteKey(relativePath)
+	if _, err := s.storage.Head(ctx, remoteKey); err != nil {
+		if storage.IsNotFound(err) {
+			// No remote copy yet — nothing to merge.
+			return local, nil
+		}
+		return nil, fmt.Errorf("checking remote history before merge: %w", err)
+	}
+
+	remote, err := s.fetchDecoded(ctx, relativePath, remoteKey)
+	if err != nil {
+		return nil, fmt.Errorf("fetching remote history for merge: %w", err)
+	}
+
+	merged, addedLines, err := MergeHistoryPayloads(local, remote)
+	if err != nil {
+		return nil, fmt.Errorf("merging history: %w", err)
+	}
+	if len(addedLines) == 0 {
+		return local, nil
+	}
+
+	if err := appendHistoryLines(fullPath, addedLines); err != nil {
+		return nil, fmt.Errorf("appending merged history: %w", err)
+	}
+	return merged, nil
+}
+
+// pullMergeHistory folds the remote history into the local file by APPENDING
+// the missing lines, instead of overwriting the file or declaring a conflict.
+// State is intentionally left untouched when lines are appended: the local
+// hash then differs from the last-uploaded hash, so the next push detects the
+// change and publishes the union back to the bucket.
+func (s *Syncer) pullMergeHistory(ctx context.Context, relativePath string, remoteObj storage.ObjectInfo) (bool, error) {
+	remote, err := s.fetchDecoded(ctx, relativePath, remoteObj.Key)
+	if err != nil {
+		return false, err
+	}
+
+	fullPath := filepath.Join(s.claudeDir, relativePath)
+	local, err := os.ReadFile(fullPath)
+	if err != nil && !os.IsNotExist(err) {
+		return false, err
+	}
+
+	_, addedLines, err := MergeHistoryPayloads(local, remote)
+	if err != nil {
+		return false, err
+	}
+	if len(addedLines) == 0 {
+		// Local is already a superset; if it differs from state the next push
+		// will publish it.
+		return false, nil
+	}
+
+	if err := appendHistoryLines(fullPath, addedLines); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // downloadFile downloads and decrypts a file from remote storage.
