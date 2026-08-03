@@ -73,6 +73,7 @@ func main() {
 		updateCmd(),
 		changelogCmd(),
 		mcpCmd(),
+		desktopCmd(),
 		autoCmd(),
 		pathsCmd(),
 	)
@@ -1011,7 +1012,7 @@ func runWebDAVWizard(webdavURL, username, password, pathPrefix string) (*storage
 }
 
 func pushCmd() *cobra.Command {
-	var includeMCP bool
+	var includeMCP, includeDesktopSessions bool
 
 	cmd := &cobra.Command{
 		Use:   "push",
@@ -1109,16 +1110,24 @@ func pushCmd() *cobra.Command {
 				}
 			}
 
+			// Desktop session pointer sync if enabled
+			if includeDesktopSessions || cfg.IsDesktopSessionSyncEnabled() {
+				if err := runDesktopSessionsPush(ctx, syncer); err != nil {
+					return err
+				}
+			}
+
 			return nil
 		},
 	}
 
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
+	cmd.Flags().BoolVar(&includeDesktopSessions, "include-desktop-sessions", false, "Also sync Claude Desktop's Code-tab session pointers")
 	return cmd
 }
 
 func pullCmd() *cobra.Command {
-	var dryRun, force, includeMCP, rebuildHistory bool
+	var dryRun, force, includeMCP, includeDesktopSessions, rebuildHistory bool
 
 	cmd := &cobra.Command{
 		Use:   "pull",
@@ -1247,6 +1256,13 @@ Examples:
 				}
 			}
 
+			// Desktop session pointer sync if enabled
+			if includeDesktopSessions || cfg.IsDesktopSessionSyncEnabled() {
+				if err := runDesktopSessionsPull(ctx, syncer); err != nil {
+					return err
+				}
+			}
+
 			// Rebuild prompt history from the freshly-pulled session files.
 			if rebuildHistory && !dryRun {
 				if err := runHistoryRebuild(); err != nil {
@@ -1261,6 +1277,7 @@ Examples:
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite existing files without confirmation")
 	cmd.Flags().BoolVar(&includeMCP, "include-mcp", false, "Also sync MCP server configs from ~/.claude.json")
+	cmd.Flags().BoolVar(&includeDesktopSessions, "include-desktop-sessions", false, "Also sync Claude Desktop's Code-tab session pointers")
 	cmd.Flags().BoolVar(&rebuildHistory, "rebuild-history", false, "Rebuild ~/.claude/history.jsonl from session files after pulling")
 
 	return cmd
@@ -2988,6 +3005,192 @@ func runMCPPull(ctx context.Context, syncer *sync.Syncer) error {
 			fmt.Printf("%s✓%s MCP pull complete: %s\n", colorGreen, colorReset, strings.Join(parts, ", "))
 		} else {
 			fmt.Printf("%s✓%s MCP servers: already up to date\n", colorGreen, colorReset)
+		}
+	}
+	return nil
+}
+
+// Desktop session pointer sync commands
+
+func desktopCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "desktop",
+		Short: "Manage Claude Desktop Code-tab session sync",
+		Long: `Sync Claude Desktop's Code-tab session pointers across devices.
+
+Regular push/pull already moves the underlying conversation transcripts
+(~/.claude/projects/*.jsonl), which is enough for 'claude --resume' to work
+on another device. Claude Desktop's own Code-tab session list is driven by a
+separate, per-device pointer file, so a transcript that's fully synced still
+won't show up in Desktop's GUI on another device without this.`,
+	}
+	cmd.AddCommand(
+		desktopStatusCmd(),
+		desktopEnableCmd(),
+		desktopDisableCmd(),
+		desktopPushCmd(),
+		desktopPullCmd(),
+	)
+	return cmd
+}
+
+func desktopStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "status",
+		Short: "Show Desktop session sync settings",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			if cfg.IsDesktopSessionSyncEnabled() {
+				fmt.Printf("  Auto-sync  %s✓ enabled%s  (included in every push/pull)\n", colorGreen, colorReset)
+			} else {
+				fmt.Printf("  Auto-sync  %s✗ disabled%s  (use --include-desktop-sessions or 'desktop push/pull')\n", colorDim, colorReset)
+			}
+
+			fmt.Printf("\n  %sdesktop enable%s   — auto-include in every push/pull\n", colorDim, colorReset)
+			fmt.Printf("  %sdesktop disable%s  — manual only\n", colorDim, colorReset)
+
+			return nil
+		},
+	}
+}
+
+func desktopEnableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "enable",
+		Short: "Enable automatic Desktop session sync on every push/pull (syncs now too)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			cfg.SetDesktopSessionSync(true)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("%s✓%s Desktop session auto-sync enabled.\n", colorGreen, colorReset)
+
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+			ctx := context.Background()
+			return runDesktopSessionsPush(ctx, syncer)
+		},
+	}
+}
+
+func desktopDisableCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "disable",
+		Short: "Disable automatic Desktop session sync on every push/pull",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			cfg.SetDesktopSessionSync(false)
+			if err := config.Save(cfg); err != nil {
+				return err
+			}
+			fmt.Printf("%s✓%s Desktop session sync disabled. Use --include-desktop-sessions flag for one-time sync.\n", colorGreen, colorReset)
+			return nil
+		},
+	}
+}
+
+func desktopPushCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "push",
+		Short: "Push Claude Desktop session pointers to cloud storage",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+
+			ctx := context.Background()
+			return runDesktopSessionsPush(ctx, syncer)
+		},
+	}
+}
+
+func desktopPullCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "pull",
+		Short: "Pull Claude Desktop session pointers from cloud storage",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+
+			ctx := context.Background()
+			return runDesktopSessionsPull(ctx, syncer)
+		},
+	}
+}
+
+func runDesktopSessionsPush(ctx context.Context, syncer *sync.Syncer) error {
+	result, err := syncer.PushDesktopSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("desktop session push failed: %w", err)
+	}
+
+	if !quiet {
+		if len(result.Pushed) == 0 {
+			fmt.Printf("%s✓%s Desktop sessions: no changes to push\n", colorGreen, colorReset)
+		} else {
+			fmt.Printf("%s✓%s Desktop sessions: %s%d pushed%s",
+				colorGreen, colorReset, colorGreen, len(result.Pushed), colorReset)
+			if result.Unchanged > 0 {
+				fmt.Printf(", %d unchanged", result.Unchanged)
+			}
+			if result.Skipped > 0 {
+				fmt.Printf(", %d skipped (not synced by this device)", result.Skipped)
+			}
+			fmt.Println()
+		}
+	}
+	return nil
+}
+
+func runDesktopSessionsPull(ctx context.Context, syncer *sync.Syncer) error {
+	result, err := syncer.PullDesktopSessions(ctx)
+	if err != nil {
+		return fmt.Errorf("desktop session pull failed: %w", err)
+	}
+
+	if !quiet {
+		var parts []string
+		if len(result.Created) > 0 {
+			parts = append(parts, fmt.Sprintf("%s%d created%s", colorGreen, len(result.Created), colorReset))
+		}
+		if len(result.Updated) > 0 {
+			parts = append(parts, fmt.Sprintf("%s%d updated%s", colorCyan, len(result.Updated), colorReset))
+		}
+		if len(result.Skipped) > 0 {
+			parts = append(parts, fmt.Sprintf("%d skipped", len(result.Skipped)))
+		}
+		if len(parts) > 0 {
+			fmt.Printf("%s✓%s Desktop sessions: %s\n", colorGreen, colorReset, strings.Join(parts, ", "))
+		} else {
+			fmt.Printf("%s✓%s Desktop sessions: already up to date\n", colorGreen, colorReset)
 		}
 	}
 	return nil

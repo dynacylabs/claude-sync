@@ -59,6 +59,13 @@ type Config struct {
 	// compatibility with existing configs.
 	MCPSync *bool `yaml:"mcp_sync,omitempty"`
 
+	// DesktopSessionSync enables syncing Claude Desktop's Code-tab session
+	// pointers (~/.config/Claude/claude-code-sessions/... and equivalents on
+	// other OSes), so a session started in Desktop on one device shows up in
+	// Desktop's own session list on another, not just via `claude --resume`.
+	// Same nil-is-disabled semantics as MCPSync.
+	DesktopSessionSync *bool `yaml:"desktop_session_sync,omitempty"`
+
 	// PathMap maps local directory prefixes to shared token names so project
 	// sessions stay resumable across devices with different layouts.
 	// The home directory is always mapped (token HOME); add entries here when
@@ -78,6 +85,10 @@ type Config struct {
 
 	// ClaudeJSONOverride allows overriding the ~/.claude.json path (for testing)
 	ClaudeJSONOverride string `yaml:"-"`
+
+	// DesktopAppDataOverride allows overriding Claude Desktop's app-data
+	// directory, i.e. the parent of claude-code-sessions/ (for testing).
+	DesktopAppDataOverride string `yaml:"-"`
 }
 
 // SyncPaths defines which paths under ~/.claude to sync in the default "full" scope.
@@ -315,6 +326,18 @@ func (c *Config) IsMCPSyncEnabled() bool {
 // SetMCPSync sets the MCP sync state. Pass true to enable, false to explicitly disable.
 func (c *Config) SetMCPSync(enabled bool) {
 	c.MCPSync = &enabled
+}
+
+// IsDesktopSessionSyncEnabled returns true if Desktop session pointer sync is
+// explicitly enabled. Returns false if DesktopSessionSync is nil (unset) or false.
+func (c *Config) IsDesktopSessionSyncEnabled() bool {
+	return c.DesktopSessionSync != nil && *c.DesktopSessionSync
+}
+
+// SetDesktopSessionSync sets the Desktop session sync state. Pass true to
+// enable, false to explicitly disable.
+func (c *Config) SetDesktopSessionSync(enabled bool) {
+	c.DesktopSessionSync = &enabled
 }
 
 // IsExcluded returns true if the given relative path matches any exclude pattern.
