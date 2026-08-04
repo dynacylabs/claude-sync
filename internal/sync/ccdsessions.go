@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -42,24 +43,50 @@ func (s *Syncer) SetCCDSessionsDir(dir string) { s.ccdDir = dir }
 // ccdSessionsDir returns the desktop-app session store, or "" when this
 // machine has none (feature silently disabled).
 //
-// Two real layouts exist. Direct installs put the store at
-// <profile>/AppData/Roaming/Claude/claude-code-sessions. MSIX-packaged
+// Layouts differ per OS. Windows direct installs put the store at
+// <profile>/AppData/Roaming/Claude/claude-code-sessions; MSIX-packaged
 // installs make that Roaming path a redirect into the package's private
 // store — a redirect WSL's drvfs cannot traverse (os.Stat fails) — with the
 // physical directory at
 // <profile>/AppData/Local/Packages/Claude_*/LocalCache/Roaming/Claude/....
-// Both are probed; the glob covers the publisher-hash suffix.
+// macOS uses <profile>/Library/Application Support/Claude/claude-code-sessions.
+// Linux uses $XDG_CONFIG_HOME/Claude/claude-code-sessions, falling back to
+// <profile>/.config/Claude/claude-code-sessions when XDG_CONFIG_HOME is unset
+// — matching Electron's own app-data resolution on each OS. The original
+// version of this function only probed the Windows paths, so Desktop session
+// sync silently did nothing on Linux and macOS regardless of the app being
+// installed there; found by testing against a Linux Desktop install.
 func (s *Syncer) ccdSessionsDir() string {
 	if s.ccdDir != "" {
 		return s.ccdDir
 	}
 	profile := filepath.Dir(s.claudeDir)
 
-	direct := filepath.Join(profile, "AppData", "Roaming", "Claude", "claude-code-sessions")
-	if info, err := os.Stat(direct); err == nil && info.IsDir() {
-		return direct
+	var candidates []string
+	switch runtime.GOOS {
+	case "windows":
+		candidates = append(candidates, filepath.Join(profile, "AppData", "Roaming", "Claude", "claude-code-sessions"))
+	case "darwin":
+		candidates = append(candidates, filepath.Join(profile, "Library", "Application Support", "Claude", "claude-code-sessions"))
+	default: // linux and other unix-likes
+		configHome := os.Getenv("XDG_CONFIG_HOME")
+		if configHome == "" {
+			configHome = filepath.Join(profile, ".config")
+		}
+		candidates = append(candidates, filepath.Join(configHome, "Claude", "claude-code-sessions"))
 	}
 
+	for _, dir := range candidates {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			return dir
+		}
+	}
+
+	// MSIX redirect fallback: Windows-only, and only reachable when the
+	// direct Roaming path above didn't exist.
+	if runtime.GOOS != "windows" {
+		return ""
+	}
 	matches, _ := filepath.Glob(filepath.Join(profile, "AppData", "Local", "Packages",
 		"Claude_*", "LocalCache", "Roaming", "Claude", "claude-code-sessions"))
 	// Prefer a store that actually holds records: a hostile or stale package
