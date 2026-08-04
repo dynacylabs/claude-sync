@@ -356,6 +356,16 @@ func (s *SyncState) DetectChanges(claudeDir string, syncPaths []string, excludeF
 	s.mu.Unlock()
 
 	for _, relPath := range knownPaths {
+		// _external/ entries (MCP servers, Desktop session pointers) are
+		// synthetic bookkeeping paths: PushMCP/PushDesktopSessions record
+		// them in state.Files for change-detection, but they were never real
+		// files under claudeDir, so GetLocalFiles (which only walks the
+		// configured syncPaths) can never find them. Without this guard,
+		// every regular Push() would see them as "no longer exists locally"
+		// on the very next run and delete the remote record it just wrote.
+		if strings.HasPrefix(relPath, "_external/") {
+			continue
+		}
 		if _, exists := localFiles[relPath]; !exists {
 			changes = append(changes, FileChange{
 				Path:   relPath,

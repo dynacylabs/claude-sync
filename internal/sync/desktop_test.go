@@ -439,6 +439,49 @@ func TestFindDesktopPointers_MultipleFiles(t *testing.T) {
 	}
 }
 
+// TestRegularPushDoesNotDeleteDesktopSessionRecords guards against a real bug
+// found during manual testing: PushDesktopSessions records its remote key
+// (_external/desktop-sessions/<id>.json) in the shared state.Files map for
+// change-detection, exactly like PushMCP does for _external/mcp-servers.json.
+// Without a guard in DetectChanges, a regular Push() sees that synthetic path
+// in state.Files, can never find it via the normal filesystem walk (it was
+// never a real file under claudeDir), concludes it was "deleted locally", and
+// wipes the remote record it just wrote — on every subsequent Push().
+func TestRegularPushDoesNotDeleteDesktopSessionRecords(t *testing.T) {
+	syncer, store, claudeDir := testSyncer(t)
+	syncer.paths = mustMapper(t, "/Users/alice", nil)
+	ctx := context.Background()
+
+	writeSessionTranscript(t, claudeDir, "-Users-alice-my-app", "cli-123")
+	appData := t.TempDir()
+	syncer.cfg.DesktopAppDataOverride = appData
+	writeDesktopFixture(t, appData, map[string]map[string]interface{}{
+		"local_aaa.json": {
+			"sessionId":    "local_aaa",
+			"cliSessionId": "cli-123",
+			"cwd":          "/Users/alice/my-app",
+			"title":        "My App Work",
+		},
+	})
+
+	if _, err := syncer.PushDesktopSessions(ctx); err != nil {
+		t.Fatalf("PushDesktopSessions: %v", err)
+	}
+	remoteKey := DesktopSessionsRemoteKeyPrefix + "cli-123.json.age"
+	if _, err := store.Download(ctx, remoteKey); err != nil {
+		t.Fatalf("record missing right after push: %v", err)
+	}
+
+	// A regular Push (e.g. the next scheduled sync, unrelated to Desktop
+	// sessions at all) must not touch it.
+	if _, err := syncer.Push(ctx); err != nil {
+		t.Fatalf("Push: %v", err)
+	}
+	if _, err := store.Download(ctx, remoteKey); err != nil {
+		t.Fatalf("regular Push deleted the desktop-session record: %v", err)
+	}
+}
+
 func TestDesktopAppDataDir_UsesOverride(t *testing.T) {
 	syncer, _, _ := testSyncer(t)
 	syncer.cfg.DesktopAppDataOverride = "/custom/path"
