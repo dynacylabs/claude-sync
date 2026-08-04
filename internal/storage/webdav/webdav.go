@@ -42,12 +42,25 @@ func New(cfg *storage.StorageConfig) (storage.Storage, error) {
 
 	prefix := strings.Trim(cfg.PathPrefix, "/")
 
+	// Push/pull fire up to defaultWorkers (internal/sync) concurrent requests
+	// at the same host. http.DefaultTransport's MaxIdleConnsPerHost is 2, so
+	// most of those requests would otherwise need a brand-new TLS handshake
+	// every time instead of reusing a pooled connection. Besides the extra
+	// latency, a burst of simultaneous new handshakes against the same
+	// certificate chain has been observed to trip a data race in
+	// crypto/x509's concurrent policy validation (fatal error: concurrent
+	// map writes). Keeping enough idle connections around for the whole
+	// worker pool means steady-state traffic reuses connections instead of
+	// re-handshaking, which avoids that race in practice.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.MaxIdleConnsPerHost = 32
+
 	return &Client{
 		baseURL:    baseURL,
 		pathPrefix: prefix,
 		username:   cfg.WebDAVUsername,
 		password:   cfg.WebDAVPassword,
-		httpClient: &http.Client{Timeout: 60 * time.Second},
+		httpClient: &http.Client{Timeout: 60 * time.Second, Transport: transport},
 	}, nil
 }
 
