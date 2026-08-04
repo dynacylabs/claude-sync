@@ -295,6 +295,16 @@ func (s *Syncer) pushCCDSessions(ctx context.Context, result *SyncResult) {
 			continue
 		}
 		local := ccdStripLocalFields(raw)
+		// cwd/originCwd are absolute paths on this machine (e.g.
+		// /home/user/claude/blink-re or C:\Users\alice\claude\blink-re).
+		// Desktop uses the record's own cwd, not just the transcript's, to
+		// group and open a session, so it needs the same ${HOME} token
+		// translation the transcript content already gets — otherwise a
+		// record pulled onto a different OS/user carries a path that
+		// doesn't exist there and Desktop can't resolve the session. jsonMode
+		// is always true here: a session record is always a single JSON
+		// object, never freeform text.
+		local = s.paths.NormalizeContent(local, true)
 		hash := HashBytes(local)
 		if st := s.state.GetFile(key); st != nil && st.Hash == hash {
 			continue
@@ -377,6 +387,13 @@ func (s *Syncer) pullCCDSessions(ctx context.Context, result *SyncResult) {
 			continue
 		}
 		remote = ccdStripLocalFields(remote)
+		// Resolve ${HOME} tokens back to this machine's own paths — the
+		// mirror of the NormalizeContent call in pushCCDSessions. Without
+		// this, a record pulled from another OS/user keeps that machine's
+		// literal cwd, and Desktop can't find the project or the transcript
+		// under it. jsonMode=true: a session record is always a single JSON
+		// object.
+		remote = s.paths.ResolveContent(remote, true)
 
 		dest := filepath.Join(installDir, org, name)
 		if raw, err := os.ReadFile(dest); err == nil {

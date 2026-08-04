@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -119,6 +120,48 @@ func TestCCDRecordSyncsAcrossMachines(t *testing.T) {
 	got := readCCDRecord(t, ccdB, "install-bbb", "local_abc.json")
 	if got != string(ccdStripLocalFields([]byte(rec))) {
 		t.Errorf("record content mismatch:\ngot  %s\nwant normalized %s", got, rec)
+	}
+}
+
+// TestCCDRecordCwdTranslatedAcrossOSes reproduces the actual bug found via
+// manual testing: a session record pushed from a Linux machine (cwd
+// /home/user/claude/blink-re) and pulled onto a Windows machine must arrive
+// with cwd rewritten to that machine's own path, and — since a Windows home
+// path contains backslashes, a JSON string-escape character — the result
+// must still be valid JSON. Before this fix, ccdRecord's cwd was carried
+// across verbatim; Desktop then couldn't locate the project (wrong OS's
+// path) or, worse, choked on a malformed record.
+func TestCCDRecordCwdTranslatedAcrossOSes(t *testing.T) {
+	store := newMockStorage()
+	linuxMachine, ccdLinux := newCCDMachine(t, store, "install-linux")
+	winMachine, ccdWin := newCCDMachine(t, store, "install-win")
+	linuxMachine.syncer.paths = mustMapper(t, "/home/user", nil)
+	winMachine.syncer.paths = mustMapper(t, `C:\Users\alice`, nil)
+	ctx := context.Background()
+
+	rec := `{"sessionId":"local_abc","cliSessionId":"11111111-2222-4333-8444-555555555555",` +
+		`"cwd":"/home/user/claude/blink-re","originCwd":"/home/user/claude/blink-re",` +
+		`"title":"Blink-re repository review","isArchived":false,"lastActivityAt":1000}`
+	writeCCDRecord(t, ccdLinux, "install-linux", "local_abc.json", rec)
+	writeFile(t, linuxMachine.claudeDir, "CLAUDE.md", "# a")
+
+	if _, err := linuxMachine.syncer.Push(ctx); err != nil {
+		t.Fatalf("linux push: %v", err)
+	}
+	if _, err := winMachine.syncer.Pull(ctx); err != nil {
+		t.Fatalf("windows pull: %v", err)
+	}
+
+	got := readCCDRecord(t, ccdWin, "install-win", "local_abc.json")
+	var v map[string]interface{}
+	if err := json.Unmarshal([]byte(got), &v); err != nil {
+		t.Fatalf("pulled record is not valid JSON: %v\ngot: %s", err, got)
+	}
+	if cwd := v["cwd"]; cwd != `C:\Users\alice/claude/blink-re` {
+		t.Errorf("cwd = %q, want %q", cwd, `C:\Users\alice/claude/blink-re`)
+	}
+	if origCwd := v["originCwd"]; origCwd != `C:\Users\alice/claude/blink-re` {
+		t.Errorf("originCwd = %q, want %q", origCwd, `C:\Users\alice/claude/blink-re`)
 	}
 }
 
