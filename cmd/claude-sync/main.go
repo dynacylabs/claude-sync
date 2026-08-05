@@ -2757,8 +2757,64 @@ func desktopCmd() *cobra.Command {
 		Short: "Manage Claude Desktop session records",
 		Long:  `Manage Claude Desktop Code-tab session pointer records synced under _ccd-sessions/.`,
 	}
-	cmd.AddCommand(desktopForgetCmd())
+	cmd.AddCommand(desktopListCmd(), desktopForgetCmd())
 	return cmd
+}
+
+func desktopListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List Desktop session records on remote storage",
+		Long: `List every Claude Desktop session pointer record on remote storage —
+every device's records, not just this machine's — with the sessionId and
+cliSessionId "claude-sync desktop forget" needs.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, err := config.Load()
+			if err != nil {
+				return err
+			}
+			syncer, err := sync.NewSyncer(cfg, quiet)
+			if err != nil {
+				return err
+			}
+
+			ctx := context.Background()
+			records, err := syncer.ListCCDSessions(ctx)
+			if err != nil {
+				return err
+			}
+			if len(records) == 0 {
+				fmt.Printf("%s⋯%s No desktop session records found\n", colorDim, colorReset)
+				return nil
+			}
+
+			for _, r := range records {
+				title := r.Title
+				if title == "" {
+					title = "(untitled)"
+				}
+				archived := ""
+				if r.IsArchived {
+					archived = fmt.Sprintf(" %s[archived]%s", colorDim, colorReset)
+				}
+				fmt.Printf("%s%s%s%s\n", colorBold, title, colorReset, archived)
+				if r.CWD != "" {
+					fmt.Printf("  cwd:          %s\n", r.CWD)
+				}
+				if r.SessionID != "" {
+					fmt.Printf("  sessionId:    %s\n", r.SessionID)
+				}
+				if r.CLISessionID != "" {
+					fmt.Printf("  cliSessionId: %s\n", r.CLISessionID)
+				}
+				if r.LastActivityAt > 0 {
+					fmt.Printf("  lastActive:   %s\n", time.UnixMilli(r.LastActivityAt).Format("2006-01-02 15:04"))
+				}
+				fmt.Println()
+			}
+			return nil
+		},
+	}
 }
 
 func desktopForgetCmd() *cobra.Command {
