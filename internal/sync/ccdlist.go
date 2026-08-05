@@ -51,12 +51,24 @@ func (s *Syncer) ListCCDSessions(ctx context.Context) ([]CCDSessionSummary, erro
 			out = append(out, CCDSessionSummary{RemoteKey: obj.Key, Title: "(invalid record)"})
 			continue
 		}
+		// fetchDecoded doesn't resolve ${HOME} tokens for _ccd-sessions/ keys
+		// (IsPortableContentPath is false for that prefix by design — push/
+		// pull need the raw token form to compare records consistently, see
+		// pushCCDSessions/pullCCDSessions). For a listing meant to be read by
+		// a person, the actual local path is what's useful; resolve it here
+		// rather than showing "${HOME}\claude\blink-re" verbatim.
+		//
+		// jsonMode=false: rec.CWD is already a decoded Go string (json.Unmarshal
+		// above stripped any JSON escaping), not raw serialized JSON bytes, so
+		// the substituted path must go in raw — jsonMode=true here would
+		// JSON-escape it a second time (e.g. "C:\\Users\\austi", doubled).
+		cwd := string(s.paths.ResolveContent([]byte(rec.CWD), false))
 		out = append(out, CCDSessionSummary{
 			RemoteKey:      obj.Key,
 			SessionID:      rec.SessionID,
 			CLISessionID:   rec.CLISessionID,
 			Title:          rec.Title,
-			CWD:            rec.CWD,
+			CWD:            cwd,
 			IsArchived:     rec.IsArchived,
 			LastActivityAt: rec.LastActivityAt,
 		})
