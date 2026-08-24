@@ -229,6 +229,10 @@ func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
 		// ~/.claude file, so records must still publish on an otherwise
 		// no-op push.
 		s.pushCCDSessions(ctx, result)
+		if len(result.Uploaded) > 0 {
+			s.state.LastPush = time.Now()
+			s.state.LastSync = time.Now()
+		}
 		if err := s.state.Save(); err != nil {
 			return result, fmt.Errorf("failed to save state: %w", err)
 		}
