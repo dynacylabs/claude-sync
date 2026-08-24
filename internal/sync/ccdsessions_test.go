@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -66,9 +67,22 @@ func readCCDRecord(t *testing.T, ccdDir, installID, name string) string {
 // under AppData\Local\Packages (the Roaming path is an MSIX redirect there
 // that WSL's drvfs cannot traverse — verified on a real machine).
 func TestCCDSessionsDirDetection(t *testing.T) {
+	// ccdSessionsDir branches on runtime.GOOS, so the expected direct-layout
+	// path (and whether the MSIX fallback applies at all) must follow suit —
+	// otherwise this only passes when run on Windows.
+	t.Setenv("XDG_CONFIG_HOME", "")
+
 	// Direct layout.
 	profile := t.TempDir()
-	direct := filepath.Join(profile, "AppData", "Roaming", "Claude", "claude-code-sessions")
+	var direct string
+	switch runtime.GOOS {
+	case "windows":
+		direct = filepath.Join(profile, "AppData", "Roaming", "Claude", "claude-code-sessions")
+	case "darwin":
+		direct = filepath.Join(profile, "Library", "Application Support", "Claude", "claude-code-sessions")
+	default:
+		direct = filepath.Join(profile, ".config", "Claude", "claude-code-sessions")
+	}
 	if err := os.MkdirAll(direct, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -77,16 +91,19 @@ func TestCCDSessionsDirDetection(t *testing.T) {
 		t.Errorf("direct layout: got %q, want %q", got, direct)
 	}
 
-	// MSIX layout (no accessible Roaming path).
-	profile2 := t.TempDir()
-	msix := filepath.Join(profile2, "AppData", "Local", "Packages", "Claude_pzs8sxrjxfjjc",
-		"LocalCache", "Roaming", "Claude", "claude-code-sessions")
-	if err := os.MkdirAll(msix, 0700); err != nil {
-		t.Fatal(err)
-	}
-	s2 := &Syncer{claudeDir: filepath.Join(profile2, ".claude")}
-	if got := s2.ccdSessionsDir(); got != msix {
-		t.Errorf("msix layout: got %q, want %q", got, msix)
+	// MSIX fallback is Windows-only: on other OSes ccdSessionsDir returns ""
+	// immediately without checking the filesystem, so nothing to assert there.
+	if runtime.GOOS == "windows" {
+		profile2 := t.TempDir()
+		msix := filepath.Join(profile2, "AppData", "Local", "Packages", "Claude_pzs8sxrjxfjjc",
+			"LocalCache", "Roaming", "Claude", "claude-code-sessions")
+		if err := os.MkdirAll(msix, 0700); err != nil {
+			t.Fatal(err)
+		}
+		s2 := &Syncer{claudeDir: filepath.Join(profile2, ".claude")}
+		if got := s2.ccdSessionsDir(); got != msix {
+			t.Errorf("msix layout: got %q, want %q", got, msix)
+		}
 	}
 
 	// No store at all.
