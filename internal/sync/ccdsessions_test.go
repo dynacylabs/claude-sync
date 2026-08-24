@@ -8,13 +8,19 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 const testOrg = "3d583d51-f79f-4cd8-a62d-780a3f79886c"
 
+// testCLISessionID is the cliSessionId every ccdRecord fixture (and most
+// hand-written record JSON in these tests) carries. newCCDMachine gives it a
+// matching transcript so its records count as synced and actually push/pull.
+const testCLISessionID = "11111111-2222-4333-8444-555555555555"
+
 // ccdRecord builds a minimal desktop-session record like the app writes.
 func ccdRecord(sessionID, title string, lastActivityAt int64) string {
-	return `{"sessionId":"` + sessionID + `","cliSessionId":"11111111-2222-4333-8444-555555555555",` +
+	return `{"sessionId":"` + sessionID + `","cliSessionId":"` + testCLISessionID + `",` +
 		`"cwd":"C:\\Users\\alice\\code\\proj","title":"` + title + `",` +
 		`"isArchived":false,"lastActivityAt":` + itoa64(lastActivityAt) + `}`
 }
@@ -34,7 +40,8 @@ func itoa64(n int64) string {
 }
 
 // newCCDMachine is newTestMachine plus a desktop-app session store with one
-// install-id directory (different per machine, as in real installs).
+// install-id directory (different per machine, as in real installs), and a
+// stub transcript for testCLISessionID so its records count as synced.
 func newCCDMachine(t *testing.T, store *mockStorage, installID string) (*testEnv, string) {
 	t.Helper()
 	env := newTestMachine(t, store)
@@ -43,12 +50,33 @@ func newCCDMachine(t *testing.T, store *mockStorage, installID string) (*testEnv
 		t.Fatal(err)
 	}
 	env.syncer.SetCCDSessionsDir(ccdDir)
+	writeCCDTranscript(t, env.claudeDir, testCLISessionID)
 	return env, ccdDir
+}
+
+// writeCCDTranscript creates a minimal transcript so cliSessionID counts as
+// synced by ccdSyncedSessionIDs — required for its Desktop pointer to push
+// or pull at all.
+func writeCCDTranscript(t *testing.T, claudeDir, cliSessionID string) {
+	t.Helper()
+	writeFile(t, claudeDir, filepath.Join("projects", "-test-project", cliSessionID+".jsonl"), "{}\n")
 }
 
 func writeCCDRecord(t *testing.T, ccdDir, installID, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(ccdDir, installID, testOrg, name), []byte(content), 0600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// backdateCCDRecord ages a pointer file's mtime past ccdPointerFreshWindow,
+// simulating one Desktop wrote a while ago rather than one this test just
+// wrote — otherwise the pull freshness guard refuses to touch it.
+func backdateCCDRecord(t *testing.T, ccdDir, installID, name string) {
+	t.Helper()
+	path := filepath.Join(ccdDir, installID, testOrg, name)
+	old := time.Now().Add(-2 * ccdPointerFreshWindow)
+	if err := os.Chtimes(path, old, old); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -200,8 +228,11 @@ func TestCCDNewerRecordWins(t *testing.T) {
 		t.Fatalf("A push: %v", err)
 	}
 
-	// B holds an older copy; a pull must overwrite it with the newer one.
+	// B holds an older copy that isn't being actively written right now (its
+	// mtime is outside ccdPointerFreshWindow); a pull must overwrite it with
+	// the newer one.
 	writeCCDRecord(t, ccdB, "install-bbb", "local_abc.json", older)
+	backdateCCDRecord(t, ccdB, "install-bbb", "local_abc.json")
 	if _, err := machineB.syncer.Pull(ctx); err != nil {
 		t.Fatalf("B pull: %v", err)
 	}
@@ -366,5 +397,85 @@ func TestCCDPullRejectsTraversalKeys(t *testing.T) {
 		if len(matches) > 0 {
 			t.Errorf("hostile key %s materialized: %v", n, matches)
 		}
+	}
+}
+
+// A pointer whose cliSessionId has no matching transcript under
+// ~/.claude/projects must not be pushed: the other machine would only get a
+// sidebar entry with nothing behind it.
+func TestCCDPushSkipsPointerWithoutSyncedTranscript(t *testing.T) {
+	store := newMockStorage()
+	machine, ccdDir := newCCDMachine(t, store, "install-aaa")
+	ctx := context.Background()
+
+	// newCCDMachine already planted a transcript for testCLISessionID;
+	// remove it so this machine has no synced transcript for the pointer.
+	if err := os.RemoveAll(filepath.Join(machine.claudeDir, "projects")); err != nil {
+		t.Fatal(err)
+	}
+
+	writeCCDRecord(t, ccdDir, "install-aaa", "local_abc.json", ccdRecord("local_abc", "orphan", 1000))
+	writeFile(t, machine.claudeDir, "CLAUDE.md", "# a")
+	if _, err := machine.syncer.Push(ctx); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	if _, err := store.Head(ctx, "_ccd-sessions/"+testOrg+"/local_abc.json"); err == nil {
+		t.Error("pointer without a synced transcript was pushed")
+	}
+}
+
+// A remote pointer whose cliSessionId has no matching transcript on this
+// machine must not be materialized: it would be a dead sidebar entry here.
+func TestCCDPullSkipsPointerWithoutSyncedTranscript(t *testing.T) {
+	store := newMockStorage()
+	pusher, ccdPusher := newCCDMachine(t, store, "install-aaa")
+	ctx := context.Background()
+
+	writeCCDRecord(t, ccdPusher, "install-aaa", "local_abc.json", ccdRecord("local_abc", "shared", 1000))
+	writeFile(t, pusher.claudeDir, "CLAUDE.md", "# a")
+	if _, err := pusher.syncer.Push(ctx); err != nil {
+		t.Fatalf("push: %v", err)
+	}
+
+	puller, ccdPuller := newCCDMachine(t, store, "install-bbb")
+	// This machine excludes the project the pointer's transcript lives in, so
+	// it never has (and never will, even via the regular file pull that just
+	// ran) a copy of it.
+	puller.syncer.cfg.Exclude = []string{"projects/-test-project/**"}
+	if _, err := puller.syncer.Pull(ctx); err != nil {
+		t.Fatalf("pull: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(ccdPuller, "install-bbb", testOrg, "local_abc.json")); err == nil {
+		t.Error("pointer without a synced transcript was materialized")
+	}
+}
+
+// A local pointer modified very recently must not be overwritten by pull,
+// even when the remote copy is logically newer: a fresh mtime most likely
+// means Desktop has the session open on this machine right now.
+func TestCCDPullSkipsFreshLocalPointer(t *testing.T) {
+	store := newMockStorage()
+	machineA, ccdA := newCCDMachine(t, store, "install-aaa")
+	machineB, ccdB := newCCDMachine(t, store, "install-bbb")
+	ctx := context.Background()
+
+	writeCCDRecord(t, ccdA, "install-aaa", "local_abc.json", ccdRecord("local_abc", "title v2", 2000))
+	writeFile(t, machineA.claudeDir, "CLAUDE.md", "# a")
+	if _, err := machineA.syncer.Push(ctx); err != nil {
+		t.Fatalf("A push: %v", err)
+	}
+
+	// B's copy is older by lastActivityAt but was just written (as if
+	// Desktop is mid-edit on this machine right now).
+	writeCCDRecord(t, ccdB, "install-bbb", "local_abc.json", ccdRecord("local_abc", "title v1", 1000))
+	if _, err := machineB.syncer.Pull(ctx); err != nil {
+		t.Fatalf("B pull: %v", err)
+	}
+
+	got := readCCDRecord(t, ccdB, "install-bbb", "local_abc.json")
+	if !strings.Contains(got, "title v1") {
+		t.Errorf("pull clobbered a freshly-written local pointer: %s", got)
 	}
 }

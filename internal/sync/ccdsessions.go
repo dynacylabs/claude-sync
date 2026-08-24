@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/tawanorg/claude-sync/internal/storage"
 )
@@ -35,6 +36,12 @@ import (
 
 // CCDSessionsPrefix is the reserved remote prefix for desktop session records.
 const CCDSessionsPrefix = "_ccd-sessions/"
+
+// ccdPointerFreshWindow guards against racing the desktop app's own write: a
+// pointer file modified more recently than this is left alone on pull, since
+// that most likely means Desktop has the session open right now on this
+// machine.
+const ccdPointerFreshWindow = 5 * time.Minute
 
 // SetCCDSessionsDir overrides the desktop-app session store location
 // (default: auto-detected next to the claude dir; tests inject a temp dir).
@@ -130,7 +137,8 @@ func ccdSafeSegment(s string) bool {
 
 // ccdRecordMeta is the subset of a session record needed for merging.
 type ccdRecordMeta struct {
-	LastActivityAt int64 `json:"lastActivityAt"`
+	LastActivityAt int64  `json:"lastActivityAt"`
+	CLISessionID   string `json:"cliSessionId"`
 }
 
 func ccdLastActivity(data []byte) int64 {
@@ -139,6 +147,54 @@ func ccdLastActivity(data []byte) int64 {
 		return 0
 	}
 	return m.LastActivityAt
+}
+
+// ccdCLISessionID extracts a record's cliSessionId, the join key back to the
+// transcript in ~/.claude/projects this tool already syncs.
+func ccdCLISessionID(data []byte) string {
+	var m ccdRecordMeta
+	if json.Unmarshal(data, &m) != nil {
+		return ""
+	}
+	return m.CLISessionID
+}
+
+// ccdSyncedSessionIDs returns the transcript basenames (without .jsonl) under
+// ~/.claude/projects that this device actually syncs. A pointer whose
+// cliSessionId isn't in this set names a transcript this device doesn't have
+// or has excluded — syncing it would leave a dangling sidebar entry elsewhere
+// that 404s when clicked.
+func (s *Syncer) ccdSyncedSessionIDs() map[string]bool {
+	ids := make(map[string]bool)
+	projectsDir := filepath.Join(s.claudeDir, "projects")
+	projectDirs, err := os.ReadDir(projectsDir)
+	if err != nil {
+		return ids
+	}
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+		relDir := filepath.ToSlash(filepath.Join("projects", projectDir.Name()))
+		if s.isExcluded(relDir) {
+			continue
+		}
+		files, err := os.ReadDir(filepath.Join(projectsDir, projectDir.Name()))
+		if err != nil {
+			continue
+		}
+		for _, f := range files {
+			name := f.Name()
+			if f.IsDir() || !strings.HasSuffix(name, ".jsonl") {
+				continue
+			}
+			if s.isExcluded(relDir + "/" + name) {
+				continue
+			}
+			ids[strings.TrimSuffix(name, ".jsonl")] = true
+		}
+	}
+	return ids
 }
 
 // ccdNewerThan reports whether record a should win over record b: higher
@@ -283,6 +339,7 @@ func (s *Syncer) pushCCDSessions(ctx context.Context, result *SyncResult) {
 		result.Errors = append(result.Errors, fmt.Errorf("ccd sessions: %w", err))
 		return
 	}
+	syncedIDs := s.ccdSyncedSessionIDs()
 
 	for key, path := range records {
 		raw, err := os.ReadFile(path)
@@ -292,6 +349,11 @@ func (s *Syncer) pushCCDSessions(ctx context.Context, result *SyncResult) {
 		// A torn read (the app writes concurrently) must never become the
 		// bucket copy; skip and let the next sync retry a settled file.
 		if !json.Valid(raw) {
+			continue
+		}
+		// A pointer whose transcript this device doesn't sync would become a
+		// dangling sidebar entry elsewhere — nothing to open.
+		if !syncedIDs[ccdCLISessionID(raw)] {
 			continue
 		}
 		local := ccdStripLocalFields(raw)
@@ -356,6 +418,7 @@ func (s *Syncer) pullCCDSessions(ctx context.Context, result *SyncResult) {
 		result.Errors = append(result.Errors, fmt.Errorf("ccd sessions: %w", err))
 		return
 	}
+	syncedIDs := s.ccdSyncedSessionIDs()
 
 	for _, obj := range objects {
 		rel := strings.TrimPrefix(obj.Key, CCDSessionsPrefix)
@@ -394,12 +457,26 @@ func (s *Syncer) pullCCDSessions(ctx context.Context, result *SyncResult) {
 		// under it. jsonMode=true: a session record is always a single JSON
 		// object.
 		remote = s.paths.ResolveContent(remote, true)
+		// A pointer whose transcript this device doesn't sync would be a
+		// dangling sidebar entry — nothing to open.
+		if !syncedIDs[ccdCLISessionID(remote)] {
+			continue
+		}
 
 		dest := filepath.Join(installDir, org, name)
 		if raw, err := os.ReadFile(dest); err == nil {
 			local := ccdStripLocalFields(raw)
-			if HashBytes(local) == HashBytes(remote) || !ccdNewerThan(remote, local) {
-				// Local wins or is identical; push publishes when needed.
+			if HashBytes(local) == HashBytes(remote) {
+				continue
+			}
+			if info, statErr := os.Stat(dest); statErr == nil && time.Since(info.ModTime()) < ccdPointerFreshWindow {
+				// Desktop is likely writing this file right now on this
+				// machine; don't race it. The next pull will retry once it
+				// settles.
+				continue
+			}
+			if !ccdNewerThan(remote, local) {
+				// Local wins; push publishes when needed.
 				continue
 			}
 		}
