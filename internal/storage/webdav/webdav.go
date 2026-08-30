@@ -17,6 +17,19 @@ func init() {
 	storage.NewWebDAV = New
 }
 
+// requestTimeout bounds an entire HTTP request — connect, headers, and full
+// body transfer — since http.Client.Timeout covers all of it, not just
+// connection setup.
+//
+// Was 60s, which is fine for small files but fails every upload/download of
+// a large one with "context deadline exceeded", regardless of the transfer
+// actually succeeding given enough time: a real transcript push hit this at
+// 887MB on a home connection. 90 minutes covers MaxDownloadSize's new 2GB
+// ceiling even at a conservative ~5 Mbps upload (≈55 minutes worst case),
+// while still failing an actually-stuck connection eventually instead of
+// hanging forever.
+const requestTimeout = 90 * time.Minute
+
 // Client implements the storage.Storage interface for WebDAV (Nextcloud, ownCloud, etc.)
 type Client struct {
 	baseURL    string
@@ -60,7 +73,7 @@ func New(cfg *storage.StorageConfig) (storage.Storage, error) {
 		pathPrefix: prefix,
 		username:   cfg.WebDAVUsername,
 		password:   cfg.WebDAVPassword,
-		httpClient: &http.Client{Timeout: 60 * time.Second, Transport: transport},
+		httpClient: &http.Client{Timeout: requestTimeout, Transport: transport},
 	}, nil
 }
 
