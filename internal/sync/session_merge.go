@@ -46,8 +46,8 @@ type sessionRecord struct {
 //     byte-identical — appends nothing, so a stale intermediate remote
 //     record (e.g. remote wrote mode=plan then mode=normal, matching
 //     local's mode=normal) can never resurrect as a spurious append.
-//   - other uuid-less records (queue-operation, ...): exact-raw-line multiset
-//     union, the same rule that makes the history merge idempotent.
+//   - other uuid-less records (queue-operation, ...): whitespace-trimmed-line
+//     multiset union, the same rule that makes the history merge idempotent.
 //
 // Unparseable remote lines with no exact local match are dropped, not
 // propagated.

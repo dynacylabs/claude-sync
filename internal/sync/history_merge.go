@@ -19,9 +19,11 @@ import (
 // (a live Claude Code session) can never lose lines to a stale-read rewrite.
 //
 // Remote lines are dropped as duplicates when either:
-//   - an identical raw line exists locally (exact-byte multiset match — this
-//     is what dedupes blank submissions and unknown-shape records, which have
-//     no prompt signature and would otherwise multiply on every cycle), or
+//   - an identical line exists locally, compared with surrounding whitespace
+//     trimmed (forEachLine does this, so line-ending differences between
+//     machines don't defeat the match) — this is what dedupes blank
+//     submissions and unknown-shape records, which have no prompt signature
+//     and would otherwise multiply on every cycle, or
 //   - they parse to a prompt whose sessionId+display matches a local prompt
 //     within historyDedupeWindowMs (same rule as RebuildHistory; the local
 //     line wins and keeps its pastedContents).

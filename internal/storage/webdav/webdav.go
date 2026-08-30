@@ -65,7 +65,15 @@ func New(cfg *storage.StorageConfig) (storage.Storage, error) {
 	// map writes). Keeping enough idle connections around for the whole
 	// worker pool means steady-state traffic reuses connections instead of
 	// re-handshaking, which avoids that race in practice.
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		// http.DefaultTransport has been replaced with a non-*http.Transport
+		// RoundTripper (e.g. under test, or by an embedder) — fall back to a
+		// fresh transport rather than panicking on the type assertion.
+		transport = &http.Transport{}
+	} else {
+		transport = transport.Clone()
+	}
 	transport.MaxIdleConnsPerHost = 32
 
 	return &Client{
@@ -414,7 +422,7 @@ func (c *Client) Head(ctx context.Context, key string) (*storage.ObjectInfo, err
 	}
 
 	if len(responses) == 0 {
-		return nil, fmt.Errorf("object not found: %s", key)
+		return nil, fmt.Errorf("%s: %w", key, storage.ErrNotFound)
 	}
 
 	r := responses[0]
