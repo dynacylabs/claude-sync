@@ -36,9 +36,17 @@ const defaultWorkers = 10
 // remote deletion of real data.
 var conflictArtifactRe = regexp.MustCompile(`\.conflict\.\d{8}-\d{6}$`)
 
-// maxDecompressedSize is the maximum allowed size for decompressed data (500MB).
+// maxDecompressedSize is the maximum allowed size for decompressed data.
 // This prevents decompression bomb attacks from consuming excessive memory.
-const maxDecompressedSize = 500 * 1024 * 1024
+//
+// Was 500MB. Kept in step with storage.MaxDownloadSize (see that constant's
+// comment): a legitimate transcript's decompressed size lands in the same
+// ballpark as its original size (JSONL text compresses only moderately), so
+// a 500MB cap here was rejecting exactly the large-but-real files that
+// prompted raising the download cap to 2GB — found when pulling a
+// previously-pushed 843MB transcript failed with "decompressed data exceeds
+// 524288000 bytes limit" even after the download-side fix.
+const maxDecompressedSize = 2 * 1024 * 1024 * 1024
 
 // ManifestKey is the remote storage key for file metadata (mtimes).
 const ManifestKey = "_metadata/manifest.json"
