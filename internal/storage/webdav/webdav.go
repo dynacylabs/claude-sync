@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tawanorg/claude-sync/internal/storage"
@@ -37,6 +38,12 @@ type Client struct {
 	httpClient *http.Client
 	username   string
 	password   string
+
+	// mkdirMu serializes MKCOL requests so concurrent uploads (the sync
+	// worker pool runs up to defaultWorkers in parallel) never race to
+	// create the same brand-new directory at once — see ensureCollection.
+	mkdirMu     sync.Mutex
+	createdDirs map[string]bool
 }
 
 // New creates a new WebDAV storage client
@@ -77,11 +84,12 @@ func New(cfg *storage.StorageConfig) (storage.Storage, error) {
 	transport.MaxIdleConnsPerHost = 32
 
 	return &Client{
-		baseURL:    baseURL,
-		pathPrefix: prefix,
-		username:   cfg.WebDAVUsername,
-		password:   cfg.WebDAVPassword,
-		httpClient: &http.Client{Timeout: requestTimeout, Transport: transport},
+		baseURL:     baseURL,
+		pathPrefix:  prefix,
+		username:    cfg.WebDAVUsername,
+		password:    cfg.WebDAVPassword,
+		httpClient:  &http.Client{Timeout: requestTimeout, Transport: transport},
+		createdDirs: make(map[string]bool),
 	}, nil
 }
 
@@ -480,7 +488,9 @@ func (c *Client) BucketExists(ctx context.Context) (bool, error) {
 	return false, fmt.Errorf("unexpected HTTP %d checking WebDAV path", resp.StatusCode)
 }
 
-// ensureParentDirs creates all parent collections for the given key via MKCOL.
+// ensureParentDirs creates all parent collections for the given key via MKCOL,
+// walking from the top down so each level's parent already exists by the time
+// it's created.
 func (c *Client) ensureParentDirs(ctx context.Context, key string) error {
 	dir := path.Dir(key)
 	if dir == "." || dir == "/" || dir == "" {
@@ -499,19 +509,58 @@ func (c *Client) ensureParentDirs(ctx context.Context, key string) error {
 			current = current + "/" + part
 		}
 
-		mkcolURL := c.collectionURL() + current + "/"
-		resp, err := c.doRequest(ctx, "MKCOL", mkcolURL, nil, nil)
-		if err != nil {
-			return err
-		}
-		_ = resp.Body.Close()
-		// 201 = created, 405 = already exists — both fine
-		if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusMethodNotAllowed && resp.StatusCode != http.StatusConflict {
-			if resp.StatusCode == http.StatusNotFound {
-				continue
-			}
+		if err := c.ensureCollection(ctx, current); err != nil {
+			return fmt.Errorf("MKCOL %s: %w", current, err)
 		}
 	}
 
 	return nil
+}
+
+// ensureCollection creates a single WebDAV collection (directory) if it
+// doesn't already exist, memoizing success so repeat calls for the same path
+// are a no-op.
+//
+// Push uploads with up to defaultWorkers concurrent requests, so the first
+// files in a brand-new directory (e.g. two tool-results files landing in the
+// same session at once) race to create it. The whole check-then-create
+// sequence runs under mkdirMu — serializing MKCOL calls entirely — so two
+// goroutines can never issue concurrent MKCOLs for the same not-yet-existing
+// path and get an ambiguous response from the server; only the directory
+// that's genuinely new pays the round-trip, everything else hits the cache.
+//
+// Previously this silently accepted any HTTP status (including a genuinely
+// failed MKCOL) and let the caller's PUT fail with an opaque 404 instead —
+// observed in practice under concurrent uploads to new subagent/tool-results
+// directories.
+func (c *Client) ensureCollection(ctx context.Context, dirPath string) error {
+	c.mkdirMu.Lock()
+	defer c.mkdirMu.Unlock()
+
+	if c.createdDirs == nil {
+		// Defensive: tests (and any other caller) construct Client with a
+		// raw struct literal rather than New(), which would otherwise leave
+		// this nil and panic on first write.
+		c.createdDirs = make(map[string]bool)
+	}
+	if c.createdDirs[dirPath] {
+		return nil
+	}
+
+	mkcolURL := c.collectionURL() + dirPath + "/"
+	resp, err := c.doRequest(ctx, "MKCOL", mkcolURL, nil, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	// 201 = created, 405 = already existed — both leave the collection
+	// present, which is all the caller needs.
+	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusMethodNotAllowed {
+		c.createdDirs[dirPath] = true
+		return nil
+	}
+
+	body, _ := io.ReadAll(resp.Body)
+	return fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 }
